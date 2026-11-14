@@ -156,6 +156,57 @@ body {
   overflow-wrap: anywhere;
   user-select: none;
   -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  transition: opacity 0.15s;
+}
+
+/* 持ち上げたカードの元の位置。どこから持ち上げたか分かるよう薄く残す */
+.card--lifted {
+  opacity: 0.3;
+}
+
+.card--saving {
+  opacity: 0.55;
+}
+
+/* 指に付いてくる、持ち上げたカードの複製。下の列を elementFromPoint で拾うため pointer-events: none */
+.drag-ghost {
+  position: fixed;
+  z-index: 10;
+  margin: 0;
+  pointer-events: none;
+  list-style: none;
+  transform-origin: center;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+  background: #3a3a3c;
+  will-change: transform;
+}
+
+.column {
+  transition: box-shadow 0.12s, background-color 0.12s;
+}
+
+.column--target {
+  background: #2e3a35;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.notice {
+  position: absolute;
+  z-index: 5;
+  top: calc(env(safe-area-inset-top) + 48px);
+  right: calc(env(safe-area-inset-right) + var(--gutter));
+  left: calc(env(safe-area-inset-left) + var(--gutter));
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: #3a3a3c;
+  color: var(--text);
+  font-size: 14px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+
+.notice[hidden] {
+  display: none;
 }
 
 .settings {

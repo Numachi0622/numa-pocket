@@ -1,6 +1,4 @@
-import type { ColumnKey, Columns } from "./parse";
-
-const COLUMN_ORDER: readonly ColumnKey[] = ["idea", "today", "done"];
+import { COLUMN_ORDER, type ColumnKey, type Columns } from "./parse";
 
 const COLUMN_LABELS: Record<ColumnKey, string> = {
   idea: "Idea",
@@ -9,34 +7,53 @@ const COLUMN_LABELS: Record<ColumnKey, string> = {
 };
 
 /**
+ * 各列のカード一覧の縦スクロール位置。
+ */
+export type CardScrollTops = Partial<Record<ColumnKey, number>>;
+
+/**
  * 描画したボード。element を DOM に入れた後で showColumn を呼ぶと、その列が画面の左側の列になる（右端の列はスクロールの端で止まる）。
  */
 export interface BoardView {
   element: HTMLElement;
   showColumn(key: ColumnKey): void;
   currentColumn(): ColumnKey;
+  /**
+   * 左右どちらかに 1 列分スライドする。それ以上スライドできない方向なら何もせず false を返す。
+   */
+  slide(direction: -1 | 1): boolean;
+  cardScrollTops(): CardScrollTops;
+  restoreCardScrollTops(tops: CardScrollTops): void;
 }
 
 /**
  * 3 列のボードを描画する。列は横スクロール（scroll-snap）で 1 画面 2 列、カードはタイトルのみでタップしても何もしない。
+ * カードには data-name にファイル名を持たせ、saving に含まれるカードには保存中の印を付ける。
  * タイトルは textContent で入れる（ファイル名を HTML として解釈させないため）。
  */
-export function renderBoard(columns: Columns): BoardView {
+export function renderBoard(columns: Columns, saving: ReadonlySet<string>): BoardView {
   const board = document.createElement("div");
   board.className = "board";
 
   const columnElements = new Map<ColumnKey, HTMLElement>();
   for (const key of COLUMN_ORDER) {
-    const column = renderColumn(key, columns[key]);
+    const column = renderColumn(key, columns, saving);
     columnElements.set(key, column);
     board.append(column);
   }
 
-  const showColumn = (key: ColumnKey) => {
+  const scrollLeftOf = (key: ColumnKey): number | null => {
     const column = columnElements.get(key);
-    if (column === undefined) return;
+    if (column === undefined) return null;
 
-    board.scrollLeft = column.offsetLeft - board.offsetLeft - leftPadding(board);
+    return column.offsetLeft - board.offsetLeft - leftPadding(board);
+  };
+
+  const showColumn = (key: ColumnKey) => {
+    const left = scrollLeftOf(key);
+    if (left === null) return;
+
+    board.scrollLeft = left;
   };
 
   const currentColumn = (): ColumnKey => {
@@ -55,14 +72,51 @@ export function renderBoard(columns: Columns): BoardView {
     return nearest;
   };
 
-  return { element: board, showColumn, currentColumn };
+  // 1 画面 2 列なので、左側に来られるのは右端の列を除いた列だけ。
+  const slide = (direction: -1 | 1): boolean => {
+    const index = COLUMN_ORDER.indexOf(currentColumn()) + direction;
+    if (index < 0 || index > COLUMN_ORDER.length - 2) return false;
+
+    const left = scrollLeftOf(COLUMN_ORDER[index]);
+    if (left === null) return false;
+
+    board.scrollTo({ left, behavior: "smooth" });
+    return true;
+  };
+
+  const cardScrollTops = (): CardScrollTops => {
+    const tops: CardScrollTops = {};
+    for (const [key, column] of columnElements) {
+      tops[key] = cardsOf(column)?.scrollTop ?? 0;
+    }
+
+    return tops;
+  };
+
+  const restoreCardScrollTops = (tops: CardScrollTops) => {
+    for (const [key, column] of columnElements) {
+      const cards = cardsOf(column);
+      const top = tops[key];
+      if (cards === null || top === undefined) continue;
+
+      cards.scrollTop = top;
+    }
+  };
+
+  return { element: board, showColumn, currentColumn, slide, cardScrollTops, restoreCardScrollTops };
 }
 
 function leftPadding(element: HTMLElement): number {
   return Number.parseFloat(getComputedStyle(element).paddingLeft) || 0;
 }
 
-function renderColumn(key: ColumnKey, titles: string[]): HTMLElement {
+function cardsOf(column: HTMLElement): HTMLElement | null {
+  return column.querySelector<HTMLElement>(".cards");
+}
+
+function renderColumn(key: ColumnKey, columns: Columns, saving: ReadonlySet<string>): HTMLElement {
+  const tasks = columns[key];
+
   const column = document.createElement("section");
   column.className = "column";
   column.dataset.column = key;
@@ -75,16 +129,17 @@ function renderColumn(key: ColumnKey, titles: string[]): HTMLElement {
 
   const count = document.createElement("span");
   count.className = "column-count";
-  count.textContent = String(titles.length);
+  count.textContent = String(tasks.length);
 
   heading.append(label, count);
 
   const cards = document.createElement("ul");
   cards.className = "cards";
-  for (const title of titles) {
+  for (const task of tasks) {
     const card = document.createElement("li");
-    card.className = "card";
-    card.textContent = title;
+    card.className = saving.has(task.name) ? "card card--saving" : "card";
+    card.dataset.name = task.name;
+    card.textContent = task.title;
     cards.append(card);
   }
 

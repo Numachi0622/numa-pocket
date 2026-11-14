@@ -23,12 +23,14 @@ interface PullState {
  * target の中で、縦スクロールが一番上にあるときの下方向の引っ張りを追い、しきい値を超えて離したら onRefresh を呼ぶ。
  * 最初の移動で引っ張りかどうかを決めて固定する。横方向・上方向・スクロール途中なら標準のスクロール（横スワイプを含む）に任せる。
  * scrollerOf はタッチ位置から縦スクロールする要素を返す。null なら常に一番上とみなす。
+ * isSuspended が true を返す間（カードのドラッグ中など）は引っ張りとして扱わない。
  */
 export function attachPullToRefresh(
   target: HTMLElement,
   indicator: PullIndicator,
   scrollerOf: (touchTarget: EventTarget | null) => HTMLElement | null,
   onRefresh: () => void,
+  isSuspended: () => boolean = () => false,
 ): void {
   let state: PullState | null = null;
 
@@ -50,6 +52,15 @@ export function attachPullToRefresh(
     "touchmove",
     (event) => {
       if (state === null || event.touches.length !== 1) return;
+
+      if (isSuspended()) {
+        if (state.mode === "pull") {
+          indicator.reset();
+        }
+
+        state.mode = "ignore";
+        return;
+      }
 
       const touch = event.touches[0];
       const dx = touch.clientX - state.startX;
