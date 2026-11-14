@@ -9,7 +9,7 @@ const COLUMN_LABELS: Record<ColumnKey, string> = {
 };
 
 /**
- * 描画したボード。element を DOM に入れた後で showColumn を呼ぶと、その列が中央に来る。
+ * 描画したボード。element を DOM に入れた後で showColumn を呼ぶと、その列が画面の左側の列になる（右端の列はスクロールの端で止まる）。
  */
 export interface BoardView {
   element: HTMLElement;
@@ -18,7 +18,7 @@ export interface BoardView {
 }
 
 /**
- * 3 列のボードを描画する。列は横スクロール（scroll-snap）で 1 画面 1 列、カードはタイトルのみでタップしても何もしない。
+ * 3 列のボードを描画する。列は横スクロール（scroll-snap）で 1 画面 2 列、カードはタイトルのみでタップしても何もしない。
  * タイトルは textContent で入れる（ファイル名を HTML として解釈させないため）。
  */
 export function renderBoard(columns: Columns): BoardView {
@@ -36,16 +36,16 @@ export function renderBoard(columns: Columns): BoardView {
     const column = columnElements.get(key);
     if (column === undefined) return;
 
-    board.scrollLeft = column.offsetLeft - (board.clientWidth - column.clientWidth) / 2;
+    board.scrollLeft = column.offsetLeft - board.offsetLeft - leftPadding(board);
   };
 
   const currentColumn = (): ColumnKey => {
-    const center = board.scrollLeft + board.clientWidth / 2;
+    const left = board.scrollLeft + board.offsetLeft + leftPadding(board);
 
     let nearest: ColumnKey = "today";
     let nearestDistance = Number.POSITIVE_INFINITY;
     for (const [key, column] of columnElements) {
-      const distance = Math.abs(column.offsetLeft + column.clientWidth / 2 - center);
+      const distance = Math.abs(column.offsetLeft - left);
       if (distance < nearestDistance) {
         nearest = key;
         nearestDistance = distance;
@@ -56,6 +56,10 @@ export function renderBoard(columns: Columns): BoardView {
   };
 
   return { element: board, showColumn, currentColumn };
+}
+
+function leftPadding(element: HTMLElement): number {
+  return Number.parseFloat(getComputedStyle(element).paddingLeft) || 0;
 }
 
 function renderColumn(key: ColumnKey, titles: string[]): HTMLElement {
