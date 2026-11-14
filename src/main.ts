@@ -1,6 +1,7 @@
 import "./style.css";
 import { renderBoard, type BoardView } from "./board";
 import { attachDrag, type DragHandle } from "./drag";
+import { DEFAULT_DRAG_TUNING, DRAG_TUNING_FIELDS, loadDragTuning, parseDragTuning, saveDragTuning, type DragTuning } from "./drag-tuning";
 import { FetchError, fetchFolderEntries, isAbortError, type FetchErrorKind } from "./github";
 import { groupByColumn, toTasks, type ColumnKey, type Task } from "./parse";
 import { attachPullToRefresh, type PullIndicator } from "./pull-to-refresh";
@@ -31,6 +32,7 @@ if (root === null) throw new Error("#app が見つかりません");
 const app: HTMLDivElement = root;
 
 let settings: Settings | null = loadSettings();
+let dragTuning: DragTuning = loadDragTuning();
 let mainScreen: MainScreen | null = null;
 let board: BoardView | null = null;
 let drag: DragHandle | null = null;
@@ -171,7 +173,7 @@ function renderTasks(screen: MainScreen): void {
       }
     },
     slide: (direction) => view.slide(direction),
-  });
+  }, dragTuning);
 }
 
 function moveTask(screen: MainScreen, name: string, to: ColumnKey): void {
@@ -261,6 +263,8 @@ function showSettings(): void {
     field("フォルダパス", folderInput),
   );
 
+  const tuningInputs = tuningSection(form, dragTuning);
+
   const message = element("p", "form-message");
   const submit = element("button", "primary", "保存");
   submit.type = "submit";
@@ -279,6 +283,7 @@ function showSettings(): void {
   form.addEventListener("submit", (event) => {
     event.preventDefault();
 
+    const parsedTuning = parseDragTuning(tuningInputsValues(tuningInputs));
     const next: Settings = {
       token: tokenInput.value.trim() || current?.token || "",
       owner: ownerInput.value.trim(),
@@ -291,13 +296,60 @@ function showSettings(): void {
       return;
     }
 
+    if (parsedTuning.tuning === null) {
+      message.textContent = parsedTuning.errors.join("\n");
+      return;
+    }
+
     saveSettings(next);
     settings = next;
+    saveDragTuning(parsedTuning.tuning);
+    dragTuning = parsedTuning.tuning;
     showMain();
     void refresh();
   });
 
   app.replaceChildren(form);
+}
+
+// 実機で操作感を詰めるための数値。保存ボタンで設定と一緒に保存する（仕様 未決 #6）。
+function tuningSection(form: HTMLFormElement, current: DragTuning): Record<keyof DragTuning, HTMLInputElement> {
+  const section = element("fieldset", "tuning");
+  section.append(element("legend", "tuning-legend", "操作の調整"));
+
+  const inputs = {} as Record<keyof DragTuning, HTMLInputElement>;
+  for (const tuningField of DRAG_TUNING_FIELDS) {
+    const control = input(tuningField.key, "number", String(current[tuningField.key]));
+    control.inputMode = "numeric";
+    control.min = String(tuningField.min);
+    control.max = String(tuningField.max);
+    control.step = "1";
+
+    const label = `${tuningField.label}（${tuningField.unit}、初期値 ${DEFAULT_DRAG_TUNING[tuningField.key]}）`;
+    section.append(field(label, control));
+    inputs[tuningField.key] = control;
+  }
+
+  const reset = element("button", "secondary", "初期値に戻す");
+  reset.type = "button";
+  reset.addEventListener("click", () => {
+    for (const tuningField of DRAG_TUNING_FIELDS) {
+      inputs[tuningField.key].value = String(DEFAULT_DRAG_TUNING[tuningField.key]);
+    }
+  });
+
+  section.append(reset);
+  form.append(section);
+  return inputs;
+}
+
+function tuningInputsValues(inputs: Record<keyof DragTuning, HTMLInputElement>): Record<keyof DragTuning, string> {
+  return {
+    longPressMs: inputs.longPressMs.value,
+    moveTolerancePx: inputs.moveTolerancePx.value,
+    edgeZonePx: inputs.edgeZonePx.value,
+    edgeDwellMs: inputs.edgeDwellMs.value,
+  };
 }
 
 // ボード上ではタッチした列のカード一覧、それ以外（取得中・エラー）ではメイン領域が縦スクロールする要素。

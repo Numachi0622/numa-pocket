@@ -1,10 +1,6 @@
+import type { DragTuning } from "./drag-tuning";
 import type { ColumnKey } from "./parse";
 
-// 実機で調整する値（仕様 未決 #6）。
-const LONG_PRESS_MS = 500;
-const MOVE_TOLERANCE_PX = 8;
-const EDGE_ZONE_PX = 40;
-const EDGE_DWELL_MS = 500;
 const SLIDE_SETTLE_MS = 400;
 const LIFT_SCALE = 1.05;
 
@@ -64,8 +60,9 @@ type DragState = { kind: "idle" } | Pressing | Dragging;
  * board の中のカード（.card[data-name]）を長押しで持ち上げ、別の列（.column[data-column]）へドラッグ＆ドロップできるようにする。
  * 長押しが成立する前に指が動いたら何もせず、標準のスクロール・横スワイプ・引っ張って更新に任せる。
  * ドラッグ中は touchmove を止め、指が左右の端のゾーンに一定時間留まったら options.slide で 1 列分スライドする。
+ * 長押しの時間・指のずれの許容・端のゾーン・端で待つ時間は tuning に従う。
  */
-export function attachDrag(board: HTMLElement, options: DragOptions): DragHandle {
+export function attachDrag(board: HTMLElement, options: DragOptions, tuning: DragTuning): DragHandle {
   let state: DragState = { kind: "idle" };
 
   const finish = (dropTo: ColumnKey | null) => {
@@ -151,7 +148,7 @@ export function attachDrag(board: HTMLElement, options: DragOptions): DragHandle
   };
 
   const updateEdge = (dragging: Dragging) => {
-    const direction = edgeDirectionAt(board, dragging.x);
+    const direction = edgeDirectionAt(board, dragging.x, tuning.edgeZonePx);
     if (direction === dragging.edgeDirection) return;
 
     if (dragging.edgeTimer !== null) {
@@ -162,7 +159,7 @@ export function attachDrag(board: HTMLElement, options: DragOptions): DragHandle
     dragging.edgeDirection = direction;
     if (direction === null || dragging.sliding) return;
 
-    dragging.edgeTimer = window.setTimeout(() => slideTowardEdge(dragging), EDGE_DWELL_MS);
+    dragging.edgeTimer = window.setTimeout(() => slideTowardEdge(dragging), tuning.edgeDwellMs);
   };
 
   // スライド中は次のスライドを始めない。落ち着いた後もまだ端にいれば、もう一度留まる時間を数える。
@@ -214,7 +211,7 @@ export function attachDrag(board: HTMLElement, options: DragOptions): DragHandle
         if (state === pressing) {
           startDragging(pressing);
         }
-      }, LONG_PRESS_MS);
+      }, tuning.longPressMs);
 
       state = pressing;
     },
@@ -231,7 +228,7 @@ export function attachDrag(board: HTMLElement, options: DragOptions): DragHandle
 
       if (state.kind === "pressing") {
         const moved = Math.hypot(touch.clientX - state.startX, touch.clientY - state.startY);
-        if (moved > MOVE_TOLERANCE_PX) {
+        if (moved > tuning.moveTolerancePx) {
           finish(null);
         }
         return;
@@ -284,10 +281,10 @@ function columnAt(board: HTMLElement, x: number, y: number): HTMLElement | null 
   return column !== null && board.contains(column) ? column : null;
 }
 
-function edgeDirectionAt(board: HTMLElement, x: number): -1 | 1 | null {
+function edgeDirectionAt(board: HTMLElement, x: number, zone: number): -1 | 1 | null {
   const rect = board.getBoundingClientRect();
-  if (x < rect.left + EDGE_ZONE_PX) return -1;
-  if (x > rect.right - EDGE_ZONE_PX) return 1;
+  if (x < rect.left + zone) return -1;
+  if (x > rect.right - zone) return 1;
 
   return null;
 }
