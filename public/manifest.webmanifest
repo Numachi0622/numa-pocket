@@ -1,0 +1,12 @@
+{
+  "name": "numa-pocket",
+  "short_name": "numa-pocket",
+  "start_url": "/numa-pocket/",
+  "scope": "/numa-pocket/",
+  "display": "standalone",
+  "background_color": "#1c1c1e",
+  "theme_color": "#1c1c1e",
+  "icons": [
+    { "src": "/numa-pocket/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

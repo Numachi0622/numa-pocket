@@ -1,0 +1,219 @@
+:root {
+  --bg: #1c1c1e;
+  --surface: #2c2c2e;
+  --text: #f2f2f7;
+  --muted: #8e8e93;
+  --accent: #78c8aa;
+  --danger: #ff6b6b;
+  --gutter: 16px;
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: var(--bg);
+  color: var(--text);
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px calc(env(safe-area-inset-right) + var(--gutter)) 8px calc(env(safe-area-inset-left) + var(--gutter));
+}
+
+.title-group {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.title {
+  margin: 0;
+  font-size: 20px;
+}
+
+.refreshing {
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.refreshing[hidden] {
+  display: none;
+}
+
+.pull-indicator {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  height: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.content:has(> .board) {
+  overflow: hidden;
+}
+
+.status {
+  margin: 0;
+  padding: 0 var(--gutter);
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.board {
+  display: flex;
+  gap: 12px;
+  height: 100%;
+  padding: 0 7.5% 12px;
+  overflow-x: auto;
+  overscroll-behavior: contain;
+  scroll-snap-type: x mandatory;
+  scrollbar-width: none;
+}
+
+.board::-webkit-scrollbar {
+  display: none;
+}
+
+.column {
+  display: flex;
+  /* ボードの左右の padding が 7.5% ずつなので、内容幅の 100% が画面幅の約 85% になる */
+  flex: 0 0 100%;
+  flex-direction: column;
+  min-height: 0;
+  scroll-snap-align: center;
+  border-radius: 14px;
+  background: #242426;
+}
+
+.column-heading {
+  display: flex;
+  flex: none;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 0;
+  padding: 14px 14px 10px;
+  font-size: 17px;
+}
+
+.column-count {
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: normal;
+}
+
+.cards {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 0 10px 10px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  list-style: none;
+}
+
+.card {
+  padding: 12px;
+  margin-bottom: 8px;
+  border-radius: 10px;
+  background: var(--surface);
+  overflow-wrap: anywhere;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.settings {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 14px;
+  padding: 12px calc(env(safe-area-inset-right) + var(--gutter)) 16px calc(env(safe-area-inset-left) + var(--gutter));
+  overflow-y: auto;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-label {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.field-input {
+  padding: 10px 12px;
+  border: 1px solid #3a3a3c;
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 16px;
+}
+
+.form-message,
+.error-message {
+  margin: 0;
+  color: var(--danger);
+}
+
+.error {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 100%;
+  padding: 8px var(--gutter);
+}
+
+.error-detail {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+button {
+  padding: 10px 16px;
+  border: none;
+  border-radius: 8px;
+  font-size: 16px;
+}
+
+.primary {
+  background: var(--accent);
+  color: #10231c;
+}
+
+.secondary {
+  background: var(--surface);
+  color: var(--text);
+}
