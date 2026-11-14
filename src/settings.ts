@@ -1,7 +1,7 @@
 const STORAGE_KEY = "numa-pocket:settings";
 
 /**
- * 取得先のリポジトリとフォルダ、読み取り用トークン。localStorage にだけ保存する。
+ * 取得先のリポジトリとフォルダ、読み書き用のトークン。localStorage にだけ保存する。
  */
 export interface Settings {
   token: string;

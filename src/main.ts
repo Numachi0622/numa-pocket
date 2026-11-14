@@ -2,9 +2,11 @@ import "./style.css";
 import { renderBoard, type BoardView } from "./board";
 import { attachDrag, type DragHandle } from "./drag";
 import { DEFAULT_DRAG_TUNING, DRAG_TUNING_FIELDS, loadDragTuning, parseDragTuning, saveDragTuning, type DragTuning } from "./drag-tuning";
-import { FetchError, fetchFolderEntries, isAbortError, type FetchErrorKind } from "./github";
-import { groupByColumn, toTasks, type ColumnKey, type Task } from "./parse";
+import { withStatus } from "./frontmatter";
+import { FetchError, fetchFolderEntries, isAbortError, SaveError, updateFile, type FetchErrorKind, type SaveErrorKind } from "./github";
+import { commitMessage, findWritableNames, groupByColumn, toTasks, type ColumnKey, type Task } from "./parse";
 import { attachPullToRefresh, type PullIndicator } from "./pull-to-refresh";
+import { createSaveQueue } from "./save-queue";
 import { isComplete, loadSettings, normalizeFolder, saveSettings, type Settings } from "./settings";
 
 const ERROR_MESSAGES: Record<FetchErrorKind, string> = {
@@ -17,14 +19,32 @@ const ERROR_MESSAGES: Record<FetchErrorKind, string> = {
   unknown: "取得に失敗しました",
 };
 
-// Phase 3 の試作: 書き込まずに、この時間の後で保存できたとみなす。
-const FAKE_SAVE_MILLISECONDS = 1_000;
+const SAVE_ERROR_MESSAGES: Record<SaveErrorKind, string> = {
+  conflict: "他の端末で変更されていたので、保存せずに取り直しました",
+  auth: "トークンが無効か期限切れのため保存できませんでした",
+  forbidden: "トークンに書き込み権限が無いため保存できませんでした",
+  rateLimit: "GitHub の利用制限に達したため保存できませんでした",
+  unknownResult: "保存できたか確認できませんでした。引っ張って更新で確かめてください",
+  unknown: "保存できませんでした",
+};
+
 const NOTICE_MILLISECONDS = 4_000;
+
+/**
+ * 保存待ちの移動。ドロップした時点のタスク（sha・本文）を写して持ち、順番が来たときに最新の取得結果から読み直さない。
+ * 読み直すと、ドロップの後で取得した他の端末の変更を上書きしてしまうため（仕様 R19）。
+ */
+interface SaveJob {
+  task: Task & { text: string };
+  to: ColumnKey;
+}
 
 interface MainScreen {
   content: HTMLElement;
   refreshing: HTMLElement;
   notice: HTMLElement;
+  noticeMessage: HTMLElement;
+  noticeDetail: HTMLElement;
 }
 
 const root = document.querySelector<HTMLDivElement>("#app");
@@ -42,6 +62,8 @@ let tasks: Task[] | null = null;
 const pending = new Map<string, ColumnKey>();
 let needsRender = false;
 let noticeTimer: number | null = null;
+
+const saveQueue = createSaveQueue(saveMove);
 
 // 取得中に次のトリガーが来たら前の取得を中断し、連番が最新の取得の結果だけを画面に反映する。
 let latestRequestId = 0;
@@ -84,7 +106,10 @@ async function refresh(): Promise<void> {
     if (requestId !== latestRequestId) return;
 
     const fetchedAt = performance.now();
-    tasks = toTasks(entries, settings.folder);
+    const writableNames = await findWritableNames(entries);
+    if (requestId !== latestRequestId) return;
+
+    tasks = toTasks(entries, settings.folder, writableNames);
     renderTasks(screen);
 
     const renderedAt = performance.now();
@@ -136,8 +161,12 @@ function showMain(): void {
   notice.setAttribute("role", "status");
   notice.hidden = true;
 
+  const noticeMessage = element("p", "notice-message");
+  const noticeDetail = element("p", "notice-detail");
+  notice.append(noticeMessage, noticeDetail);
+
   app.replaceChildren(header, pull, notice, content);
-  mainScreen = { content, refreshing, notice };
+  mainScreen = { content, refreshing, notice, noticeMessage, noticeDetail };
   resetBoard();
 
   attachPullToRefresh(content, pullIndicator(pull, pullLabel), scrollerOf, () => void refresh(), () => drag?.isActive() ?? false);
@@ -165,7 +194,7 @@ function renderTasks(screen: MainScreen): void {
 
   board = view;
   drag = attachDrag(view.element, {
-    canLift: (card) => !pending.has(card.dataset.name ?? ""),
+    canLift: (card) => canLift(card.dataset.name ?? ""),
     onDrop: (card, to) => moveTask(screen, card.dataset.name ?? "", to),
     onActiveChange: (active) => {
       if (!active && needsRender) {
@@ -176,31 +205,79 @@ function renderTasks(screen: MainScreen): void {
   }, dragTuning);
 }
 
+// 保存中のカードと、本文をそのまま書き戻せないカード（findWritableNames を参照）は持ち上げない。
+function canLift(name: string): boolean {
+  if (pending.has(name)) return false;
+
+  const task = tasks?.find((candidate) => candidate.name === name);
+  if (task === undefined) return false;
+
+  if (!task.writable) {
+    console.warn(`[numa-pocket] ${name} は本文を書き戻せないため動かせません`);
+    return false;
+  }
+
+  return true;
+}
+
 function moveTask(screen: MainScreen, name: string, to: ColumnKey): void {
-  if (tasks === null || !tasks.some((task) => task.name === name)) return;
+  const task = tasks?.find((candidate) => candidate.name === name);
+  if (task === undefined || task.text === null || !task.writable) return;
 
   pending.set(name, to);
   renderTasks(screen);
-  showNotice(screen, "試作: 保存はまだしません（再取得すると元に戻ります）");
 
-  window.setTimeout(() => completeFakeSave(name, to), FAKE_SAVE_MILLISECONDS);
+  saveQueue.push({ task: { ...task, text: task.text }, to });
 }
 
-function completeFakeSave(name: string, to: ColumnKey): void {
-  pending.delete(name);
-  tasks = tasks?.map((task) => (task.name === name ? { ...task, column: to } : task)) ?? null;
+async function saveMove(job: SaveJob): Promise<void> {
+  const { task, to } = job;
 
-  if (mainScreen !== null) {
-    renderTasks(mainScreen);
+  try {
+    if (settings === null) throw new SaveError("unknown", "設定がありません");
+
+    const content = withStatus(task.text, to);
+    const { sha } = await updateFile(settings, { path: task.path, content, sha: task.sha, message: commitMessage(task, to) });
+
+    pending.delete(task.name);
+    tasks = tasks?.map((candidate) => (candidate.name === task.name ? { ...candidate, column: to, rawStatus: to, sha, text: content, writable: true } : candidate)) ?? null;
+    rerender();
+
+    // 進行中の取得の結果は書き込み前の内容かもしれないので、書き込んだ後から取り直す。
+    if (inFlight !== null) {
+      void refresh();
+    }
+  } catch (error) {
+    pending.delete(task.name);
+
+    const kind: SaveErrorKind = error instanceof SaveError ? error.kind : "unknown";
+    const detail = error instanceof SaveError ? error.detail : String(error);
+    console.error(`[numa-pocket] ${task.name} を保存できませんでした`, error);
+
+    rerender();
+    if (mainScreen !== null) {
+      showNotice(mainScreen, SAVE_ERROR_MESSAGES[kind], detail);
+    }
+
+    if (kind === "conflict") {
+      void refresh();
+    }
   }
 }
 
-function showNotice(screen: MainScreen, message: string): void {
+function rerender(): void {
+  if (mainScreen === null) return;
+
+  renderTasks(mainScreen);
+}
+
+function showNotice(screen: MainScreen, message: string, detail: string): void {
   if (noticeTimer !== null) {
     window.clearTimeout(noticeTimer);
   }
 
-  screen.notice.textContent = message;
+  screen.noticeMessage.textContent = message;
+  screen.noticeDetail.textContent = detail;
   screen.notice.hidden = false;
   noticeTimer = window.setTimeout(() => {
     screen.notice.hidden = true;
@@ -257,7 +334,7 @@ function showSettings(): void {
   folderInput.placeholder = "フォルダ/パス";
 
   form.append(
-    field("トークン（Fine-grained PAT, Contents: Read-only）", tokenInput),
+    field("トークン（Fine-grained PAT, Contents: Read and write）", tokenInput),
     field("owner", ownerInput),
     field("repo", repoInput),
     field("フォルダパス", folderInput),

@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { FolderEntry } from "./github";
-import { groupByColumn, readRawStatus, readStatus, toTasks, type Task } from "./parse";
+import { commitMessage, findWritableNames, groupByColumn, readRawStatus, readStatus, toTasks, type Task } from "./parse";
 
-function file(name: string, text: string | null): FolderEntry {
-  return { name, type: "blob", text };
+function file(name: string, text: string | null, oid = "0000000000000000000000000000000000000000"): FolderEntry {
+  return { name, type: "blob", oid, text };
 }
 
 describe("readStatus", () => {
@@ -122,14 +122,16 @@ describe("toTasks", () => {
       name: "作業中.md",
       title: "作業中",
       path: "Task/Data/作業中.md",
+      sha: "0000000000000000000000000000000000000000",
       text: "---\nstatus: wip\n---",
+      writable: false,
       column: "idea",
       rawStatus: "wip",
     });
   });
 
   it("サブフォルダは無視する", () => {
-    expect(toTasks([{ name: "archive.md", type: "tree", text: null }], "f")).toEqual([]);
+    expect(toTasks([{ name: "archive.md", type: "tree", oid: "1111111111111111111111111111111111111111", text: null }], "f")).toEqual([]);
   });
 
   it(".md 以外のファイルは無視する", () => {
@@ -162,5 +164,36 @@ describe("groupByColumn", () => {
     expect(columns.done.map((task) => task.name)).toEqual(["a.md"]);
     expect(columns.today).toEqual([]);
     expect(columns.idea.map((task) => task.name)).toEqual(["b.md"]);
+  });
+});
+
+describe("findWritableNames", () => {
+  it("本文の blob の sha が oid と一致するファイルだけを返す", async () => {
+    const entries = [
+      file("一致.md", "hello\n", "ce013625030ba8dba906f756967f9e9ca394464a"),
+      file("不一致.md", "hello\n", "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"),
+      file("本文なし.md", null, "ce013625030ba8dba906f756967f9e9ca394464a"),
+      { name: "フォルダ", type: "tree", oid: "ce013625030ba8dba906f756967f9e9ca394464a", text: "hello\n" },
+    ];
+
+    expect(await findWritableNames(entries)).toEqual(new Set(["一致.md"]));
+  });
+
+  it("toTasks に渡すと writable になる", () => {
+    const [writable, readonly] = toTasks([file("a.md", ""), file("b.md", "")], "f", new Set(["a.md"]));
+
+    expect(writable.writable).toBe(true);
+    expect(readonly.writable).toBe(false);
+  });
+});
+
+describe("commitMessage", () => {
+  it.each([
+    ["today", "numa-pocket: つまようじを買う today → done"],
+    ["wip", "numa-pocket: つまようじを買う wip → done"],
+    [null, "numa-pocket: つまようじを買う (なし) → done"],
+    ["", "numa-pocket: つまようじを買う (なし) → done"],
+  ])("元の status が %j", (rawStatus, expected) => {
+    expect(commitMessage({ title: "つまようじを買う", rawStatus }, "done")).toBe(expected);
   });
 });

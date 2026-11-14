@@ -209,6 +209,21 @@ body {
   display: none;
 }
 
+.notice-message {
+  margin: 0;
+}
+
+.notice-detail {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.notice-detail:empty {
+  display: none;
+}
+
 .settings {
   display: flex;
   flex: 1;

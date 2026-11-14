@@ -1,3 +1,5 @@
+import { gitBlobSha } from "./blob-sha";
+import { findFrontmatterEnd, STATUS_LINE } from "./frontmatter";
 import type { FolderEntry } from "./github";
 
 /**
@@ -20,8 +22,12 @@ export interface Task {
   title: string;
   /** リポジトリのルートからのパス。 */
   path: string;
+  /** blob の sha。書き込むときに、取得した後でファイルが変わっていないかの確認に使う。 */
+  sha: string;
   /** 本文。取れなかった（バイナリなど）ときは null。 */
   text: string | null;
+  /** text がファイルのバイト列をそのまま表していて、書き換えて書き戻してよいか。 */
+  writable: boolean;
   /** `status` で振り分けた列。 */
   column: ColumnKey;
   /** ファイル上の `status` の値（引用符・行末コメントを除いたもの）。`status` が無ければ null。 */
@@ -34,14 +40,13 @@ export interface Task {
 export type Columns = Record<ColumnKey, Task[]>;
 
 const MARKDOWN_EXTENSION = ".md";
-const FRONTMATTER_DELIMITER = "---";
-const STATUS_LINE = /^status:(.*)$/;
 
 /**
  * フォルダ直下のエントリから、タスクファイルだけを Task にする。
  * サブフォルダと `.md` 以外のファイルは無視し、`status` が無い・読めない・想定外の値なら idea の列にする。
+ * writableNames に入っているファイルだけを書き戻してよいタスクにする（findWritableNames の結果を渡す）。
  */
-export function toTasks(entries: FolderEntry[], folder: string): Task[] {
+export function toTasks(entries: FolderEntry[], folder: string, writableNames: ReadonlySet<string> = new Set()): Task[] {
   const tasks: Task[] = [];
 
   for (const entry of entries) {
@@ -52,13 +57,45 @@ export function toTasks(entries: FolderEntry[], folder: string): Task[] {
       name: entry.name,
       title: entry.name.slice(0, -MARKDOWN_EXTENSION.length),
       path: `${folder}/${entry.name}`,
+      sha: entry.oid,
       text: entry.text,
+      writable: writableNames.has(entry.name),
       column: toColumnKey(rawStatus),
       rawStatus,
     });
   }
 
   return tasks;
+}
+
+/**
+ * 本文を UTF-8 にして計算した blob の sha が oid と一致するエントリの名前を返す。
+ * 一致しない本文（BOM や改行が変わっている、切り詰められている、UTF-8 でない）を書き戻すとファイルが壊れるため、そのタスクは動かせないようにする。
+ */
+export async function findWritableNames(entries: FolderEntry[]): Promise<Set<string>> {
+  const names = new Set<string>();
+
+  for (const entry of entries) {
+    if (entry.type !== "blob" || entry.text === null) continue;
+
+    const sha = await gitBlobSha(entry.text);
+    if (sha === entry.oid) {
+      names.add(entry.name);
+      continue;
+    }
+
+    console.warn(`[numa-pocket] ${entry.name} は取得した本文が元のファイルと一致しないため、動かせないようにします`);
+  }
+
+  return names;
+}
+
+/**
+ * 列を移したときのコミットメッセージ。元の status がファイルに無い（値が空を含む）ときは `(なし)`、想定外の値はそのまま書く。
+ */
+export function commitMessage(task: Pick<Task, "title" | "rawStatus">, to: ColumnKey): string {
+  const from = task.rawStatus === null || task.rawStatus === "" ? "(なし)" : task.rawStatus;
+  return `numa-pocket: ${task.title} ${from} → ${to}`;
 }
 
 /**
@@ -85,11 +122,9 @@ export function readStatus(text: string): ColumnKey {
  * 本文の frontmatter にあるトップレベルの `status` の値を、引用符と行末コメントを除いて返す。frontmatter や `status` が無ければ null。
  */
 export function readRawStatus(text: string): string | null {
-  const lines = text.replace(/^﻿/, "").split(/\r?\n/);
-  if (lines[0]?.trimEnd() !== FRONTMATTER_DELIMITER) return null;
-
-  const closingIndex = lines.findIndex((line, index) => index > 0 && line.trimEnd() === FRONTMATTER_DELIMITER);
-  if (closingIndex < 0) return null;
+  const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/);
+  const closingIndex = findFrontmatterEnd(lines);
+  if (closingIndex === null) return null;
 
   for (const line of lines.slice(1, closingIndex)) {
     const match = STATUS_LINE.exec(line);
