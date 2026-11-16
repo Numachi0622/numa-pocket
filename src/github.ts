@@ -180,11 +180,12 @@ export class SaveError extends Error {
 
 /**
  * ファイル 1 つを書き換える内容。sha は取得したときの blob の sha で、GitHub 上のファイルがこれと違えば書き込まれない。
+ * sha を省くと新規作成になり、同じパスのファイルが既にあれば書き込まれない（上書きしない）。
  */
 export interface FileUpdate {
   path: string;
   content: string;
-  sha: string;
+  sha?: string;
   message: string;
 }
 
@@ -209,7 +210,7 @@ export async function updateFile(settings: Settings, update: FileUpdate): Promis
         Accept: "application/vnd.github+json",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ message: update.message, content: toBase64(update.content), sha: update.sha }),
+      body: JSON.stringify({ message: update.message, content: toBase64(update.content), ...(update.sha === undefined ? {} : { sha: update.sha }) }),
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "TimeoutError") {

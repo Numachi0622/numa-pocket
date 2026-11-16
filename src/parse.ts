@@ -99,6 +99,31 @@ export function commitMessage(task: Pick<Task, "title" | "rawStatus">, to: Colum
 }
 
 /**
+ * 新しく追加するタスク。中身は `status` だけの frontmatter（改行は LF）。sha は作成後に GitHub から返るまで空で、それまでは書き戻せない扱いにする。
+ */
+export function newTask(folder: string, title: string, column: ColumnKey): Task & { text: string } {
+  const name = `${title}${MARKDOWN_EXTENSION}`;
+
+  return {
+    name,
+    title,
+    path: `${folder}/${name}`,
+    sha: "",
+    text: `---\nstatus: ${column}\n---\n`,
+    writable: false,
+    column,
+    rawStatus: column,
+  };
+}
+
+/**
+ * タスクを追加したときのコミットメッセージ。移動のメッセージの元の位置に `(新規)` を置く。
+ */
+export function addCommitMessage(title: string, column: ColumnKey): string {
+  return `numa-pocket: ${title} (新規) → ${column}`;
+}
+
+/**
  * タスクを列ごとに分ける。columnOf を渡すと、その列で振り分ける（保存中の移動を反映するため）。
  */
 export function groupByColumn(tasks: Task[], columnOf: (task: Task) => ColumnKey = (task) => task.column): Columns {

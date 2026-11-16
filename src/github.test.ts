@@ -72,6 +72,15 @@ describe("updateFile", () => {
     expect(JSON.parse(init.body as string)).not.toHaveProperty("branch");
   });
 
+  it("sha を省くと sha を送らない（新規作成）", async () => {
+    const fetchMock = stubFetch(json(201, { content: { sha: "created-sha" } }));
+
+    expect(await updateFile(settings, { path: update.path, content: update.content, message: "add" })).toEqual({ sha: "created-sha" });
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ message: "add", content: toBase64(update.content) });
+  });
+
   it.each([
     [409, "conflict"],
     [404, "conflict"],

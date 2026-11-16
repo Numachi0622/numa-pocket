@@ -136,14 +136,77 @@ body {
   font-weight: normal;
 }
 
+/* 伸ばさずに縮めるだけにする。カードが少ないと「+」が最後のカードの直下に、溢れると列の下に残って一覧だけがスクロールする */
 .cards {
-  flex: 1;
+  flex: 0 1 auto;
   min-height: 0;
   margin: 0;
   padding: 0 6px 6px;
   overflow-y: auto;
   overscroll-behavior: contain;
   list-style: none;
+}
+
+.column-add {
+  flex: none;
+  padding: 0 6px 6px;
+}
+
+.add-open {
+  width: 100%;
+  padding: 6px 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 22px;
+  line-height: 1;
+}
+
+.add-open:active {
+  background: var(--surface);
+}
+
+.add-open[hidden],
+.add-form[hidden] {
+  display: none;
+}
+
+.add-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* iOS は 16px 未満の入力欄に focus すると画面を拡大するので 16px にする */
+.add-input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid #3a3a3c;
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 16px;
+}
+
+.add-message {
+  margin: 0;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+.add-message:empty {
+  display: none;
+}
+
+.add-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.add-actions button {
+  flex: 1;
+  padding: 8px 0;
+  font-size: 15px;
 }
 
 .card {

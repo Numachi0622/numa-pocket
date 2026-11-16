@@ -1,13 +1,14 @@
 import "./style.css";
-import { renderBoard, type BoardView } from "./board";
+import { createBoard, type AddResult, type BoardView } from "./board";
 import { attachDrag, type DragHandle } from "./drag";
 import { DEFAULT_DRAG_TUNING, DRAG_TUNING_FIELDS, loadDragTuning, parseDragTuning, saveDragTuning, type DragTuning } from "./drag-tuning";
 import { withStatus } from "./frontmatter";
 import { FetchError, fetchFolderEntries, isAbortError, SaveError, updateFile, type FetchErrorKind, type SaveErrorKind } from "./github";
-import { commitMessage, findWritableNames, groupByColumn, toTasks, type ColumnKey, type Task } from "./parse";
+import { addCommitMessage, commitMessage, findWritableNames, groupByColumn, newTask, toTasks, type ColumnKey, type Task } from "./parse";
 import { attachPullToRefresh, type PullIndicator } from "./pull-to-refresh";
 import { createSaveQueue } from "./save-queue";
 import { isComplete, loadSettings, normalizeFolder, saveSettings, type Settings } from "./settings";
+import { isSameName, validateTitle } from "./task-title";
 
 const ERROR_MESSAGES: Record<FetchErrorKind, string> = {
   network: "通信できませんでした",
@@ -28,16 +29,29 @@ const SAVE_ERROR_MESSAGES: Record<SaveErrorKind, string> = {
   unknown: "保存できませんでした",
 };
 
+const DUPLICATE_ADD_MESSAGE = "同じ名前のタスクが GitHub にあったので、追加せずに取り直しました";
+
 const NOTICE_MILLISECONDS = 4_000;
 
 /**
  * 保存待ちの移動。ドロップした時点のタスク（sha・本文）を写して持ち、順番が来たときに最新の取得結果から読み直さない。
  * 読み直すと、ドロップの後で取得した他の端末の変更を上書きしてしまうため（仕様 R19）。
  */
-interface SaveJob {
+interface MoveJob {
+  kind: "move";
   task: Task & { text: string };
   to: ColumnKey;
 }
+
+/**
+ * 保存待ちの追加。task は newTask で作った、まだ GitHub に無いタスク。
+ */
+interface AddJob {
+  kind: "add";
+  task: Task & { text: string };
+}
+
+type SaveJob = MoveJob | AddJob;
 
 interface MainScreen {
   content: HTMLElement;
@@ -57,13 +71,14 @@ let mainScreen: MainScreen | null = null;
 let board: BoardView | null = null;
 let drag: DragHandle | null = null;
 
-// 画面の元になる状態。ボードは「tasks の列を pending（保存中の移動。ファイル名 → 移動先）で上書きしたもの」を描く。
+// 画面の元になる状態。ボードは「tasks の列を pending（保存中の移動。ファイル名 → 移動先）で上書きし、pendingAdds（保存中の追加）を足したもの」を描く。
 let tasks: Task[] | null = null;
 const pending = new Map<string, ColumnKey>();
+const pendingAdds = new Map<string, Task & { text: string }>();
 let needsRender = false;
 let noticeTimer: number | null = null;
 
-const saveQueue = createSaveQueue(saveMove);
+const saveQueue = createSaveQueue<SaveJob>((job) => (job.kind === "move" ? saveMove(job) : saveAdd(job)));
 
 // 取得中に次のトリガーが来たら前の取得を中断し、連番が最新の取得の結果だけを画面に反映する。
 let latestRequestId = 0;
@@ -172,7 +187,7 @@ function showMain(): void {
   attachPullToRefresh(content, pullIndicator(pull, pullLabel), scrollerOf, () => void refresh(), () => drag?.isActive() ?? false);
 }
 
-// ドラッグ中は指の下の要素を消さないよう作り直さず、ドラッグが終わってから描く。
+// ドラッグ中は指の下の要素を消さないよう差し替えず、ドラッグが終わってから描く。
 function renderTasks(screen: MainScreen): void {
   if (tasks === null) return;
 
@@ -183,14 +198,15 @@ function renderTasks(screen: MainScreen): void {
 
   needsRender = false;
 
-  const keep: ColumnKey = board?.currentColumn() ?? "today";
-  const scrollTops = board?.cardScrollTops() ?? {};
-  const columns = groupByColumn(tasks, (task) => pending.get(task.name) ?? task.column);
+  const view = board ?? mountBoard(screen);
+  const columns = groupByColumn(visibleTasks(), (task) => pending.get(task.name) ?? task.column);
+  view.update(columns, new Set([...pending.keys(), ...pendingAdds.keys()]));
+}
 
-  const view = renderBoard(columns, new Set(pending.keys()));
+function mountBoard(screen: MainScreen): BoardView {
+  const view = createBoard({ onAdd: addTask });
   screen.content.replaceChildren(view.element);
-  view.showColumn(keep);
-  view.restoreCardScrollTops(scrollTops);
+  view.showColumn("today");
 
   board = view;
   drag = attachDrag(view.element, {
@@ -203,11 +219,19 @@ function renderTasks(screen: MainScreen): void {
     },
     slide: (direction) => view.slide(direction),
   }, dragTuning);
+
+  return view;
+}
+
+// 保存中の追加は一番下に出す。取得で同じファイルが先に届いていたら、保存が終わるまで保存中の方を出す。
+function visibleTasks(): Task[] {
+  const fetched = (tasks ?? []).filter((task) => !pendingAdds.has(task.name));
+  return [...fetched, ...pendingAdds.values()];
 }
 
 // 保存中のカードと、本文をそのまま書き戻せないカード（findWritableNames を参照）は持ち上げない。
 function canLift(name: string): boolean {
-  if (pending.has(name)) return false;
+  if (pending.has(name) || pendingAdds.has(name)) return false;
 
   const task = tasks?.find((candidate) => candidate.name === name);
   if (task === undefined) return false;
@@ -227,10 +251,24 @@ function moveTask(screen: MainScreen, name: string, to: ColumnKey): void {
   pending.set(name, to);
   renderTasks(screen);
 
-  saveQueue.push({ task: { ...task, text: task.text }, to });
+  saveQueue.push({ kind: "move", task: { ...task, text: task.text }, to });
 }
 
-async function saveMove(job: SaveJob): Promise<void> {
+function addTask(column: ColumnKey, rawTitle: string): AddResult {
+  if (settings === null || tasks === null) return { added: false, reason: "ボードを取得してから追加してください" };
+
+  const check = validateTitle(rawTitle, visibleTasks().map((task) => task.name));
+  if (!check.ok) return { added: false, reason: check.reason };
+
+  const task = newTask(settings.folder, check.title, column);
+  pendingAdds.set(task.name, task);
+  rerender();
+
+  saveQueue.push({ kind: "add", task });
+  return { added: true, reason: null };
+}
+
+async function saveMove(job: MoveJob): Promise<void> {
   const { task, to } = job;
 
   try {
@@ -255,14 +293,65 @@ async function saveMove(job: SaveJob): Promise<void> {
     console.error(`[numa-pocket] ${task.name} を保存できませんでした`, error);
 
     rerender();
-    if (mainScreen !== null) {
-      showNotice(mainScreen, SAVE_ERROR_MESSAGES[kind], detail);
-    }
+    notify(SAVE_ERROR_MESSAGES[kind], detail);
 
     if (kind === "conflict") {
       void refresh();
     }
   }
+}
+
+async function saveAdd(job: AddJob): Promise<void> {
+  const { task } = job;
+
+  try {
+    if (settings === null) throw new SaveError("unknown", "設定がありません");
+
+    const { sha } = await updateFile(settings, { path: task.path, content: task.text, message: addCommitMessage(task.title, task.column) });
+
+    pendingAdds.delete(task.name);
+    tasks = replaceOrAppend(tasks, { ...task, sha, writable: true });
+    rerender();
+
+    if (inFlight !== null) {
+      void refresh();
+    }
+  } catch (error) {
+    pendingAdds.delete(task.name);
+
+    const kind: SaveErrorKind = error instanceof SaveError ? error.kind : "unknown";
+    const detail = error instanceof SaveError ? error.detail : String(error);
+    console.error(`[numa-pocket] ${task.name} を追加できませんでした`, error);
+
+    rerender();
+
+    if (kind !== "conflict") {
+      notify(SAVE_ERROR_MESSAGES[kind], detail);
+      return;
+    }
+
+    // 競合に寄せている 409 / 404 / 422 のどれが返ったかでは同名かどうかを決めきれないので、取り直して確かめる。
+    void refresh().then(() => {
+      const exists = tasks?.some((candidate) => isSameName(candidate.name, task.name)) ?? false;
+      notify(exists ? DUPLICATE_ADD_MESSAGE : SAVE_ERROR_MESSAGES.unknown, detail);
+    });
+  }
+}
+
+function replaceOrAppend(current: Task[] | null, task: Task): Task[] | null {
+  if (current === null) return null;
+
+  if (current.some((candidate) => candidate.name === task.name)) {
+    return current.map((candidate) => (candidate.name === task.name ? task : candidate));
+  }
+
+  return [...current, task];
+}
+
+function notify(message: string, detail: string): void {
+  if (mainScreen === null) return;
+
+  showNotice(mainScreen, message, detail);
 }
 
 function rerender(): void {
@@ -286,6 +375,7 @@ function showNotice(screen: MainScreen, message: string, detail: string): void {
 }
 
 function resetBoard(): void {
+  board?.destroy();
   drag?.cancel();
   drag = null;
   board = null;

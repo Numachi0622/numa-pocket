@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { FolderEntry } from "./github";
-import { commitMessage, findWritableNames, groupByColumn, readRawStatus, readStatus, toTasks, type Task } from "./parse";
+import { gitBlobSha } from "./blob-sha";
+import { addCommitMessage, commitMessage, findWritableNames, groupByColumn, newTask, readRawStatus, readStatus, toTasks, type Task } from "./parse";
 
 function file(name: string, text: string | null, oid = "0000000000000000000000000000000000000000"): FolderEntry {
   return { name, type: "blob", oid, text };
@@ -195,5 +196,34 @@ describe("commitMessage", () => {
     ["", "numa-pocket: つまようじを買う (なし) → done"],
   ])("元の status が %j", (rawStatus, expected) => {
     expect(commitMessage({ title: "つまようじを買う", rawStatus }, "done")).toBe(expected);
+  });
+});
+
+describe("newTask", () => {
+  it("status だけの frontmatter を持つ、まだ書き戻せないタスクを作る", () => {
+    const task = newTask("Task/Data", "牛乳を買う", "today");
+
+    expect(task).toEqual({
+      name: "牛乳を買う.md",
+      title: "牛乳を買う",
+      path: "Task/Data/牛乳を買う.md",
+      sha: "",
+      text: "---\nstatus: today\n---\n",
+      writable: false,
+      column: "today",
+      rawStatus: "today",
+    });
+    expect(readStatus(task.text)).toBe("today");
+  });
+
+  it("中身は実際の vault のタスクファイルと同じ形（git hash-object と一致）", async () => {
+    // `printf -- '---\nstatus: idea\n---\n' | git hash-object --stdin`
+    expect(await gitBlobSha(newTask("Task/Data", "a", "idea").text)).toBe("ae3695de8ff5f9a6a264e5986c3422de54c97c44");
+  });
+});
+
+describe("addCommitMessage", () => {
+  it("元の位置に (新規) を置く", () => {
+    expect(addCommitMessage("牛乳を買う", "today")).toBe("numa-pocket: 牛乳を買う (新規) → today");
   });
 });
