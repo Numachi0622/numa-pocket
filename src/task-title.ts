@@ -39,6 +39,23 @@ export function validateTitle(raw: string, existingNames: Iterable<string>): Tit
 }
 
 /**
+ * 名前を変えるときの新しいタイトルを確かめる。validateTitle と同じ条件で、重複の判定から自分自身（currentName）を除く。
+ * 大文字・小文字（と Unicode の正規化）だけの変更は弾く（Windows の PC 側の git で扱いが不安定なため）。
+ * タイトルが変わっていないかは呼び出し側で先に確かめる。
+ */
+export function validateRename(raw: string, currentName: string, existingNames: Iterable<string>): TitleCheck {
+  const others = [...existingNames].filter((name) => name !== currentName);
+  const check = validateTitle(raw, others);
+  if (!check.ok) return check;
+
+  if (isSameName(check.name, currentName)) {
+    return { ok: false, reason: "大文字・小文字だけの変更はできません" };
+  }
+
+  return check;
+}
+
+/**
  * 大文字・小文字と Unicode の正規化の違いを無視して、2 つのファイル名が同じかを返す。
  */
 export function isSameName(a: string, b: string): boolean {

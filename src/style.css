@@ -223,6 +223,42 @@ body {
   transition: opacity 0.15s;
 }
 
+/* iOS は cursor: pointer の無い要素では、親に付けた click を送らないことがある */
+.card[data-name] {
+  cursor: pointer;
+}
+
+.card-edit {
+  margin-bottom: 6px;
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.card-edit .add-input,
+.card-edit .secondary {
+  background: var(--bg);
+}
+
+.delete {
+  width: 100%;
+  padding: 8px 0;
+  background: transparent;
+  color: var(--danger);
+  font-size: 15px;
+}
+
+.delete--armed {
+  background: var(--danger);
+  color: #2a0d0d;
+  font-weight: bold;
+}
+
+.card-edit button:disabled {
+  opacity: 0.35;
+}
+
 /* 持ち上げたカードの元の位置。どこから持ち上げたか分かるよう薄く残す */
 .card--lifted {
   opacity: 0.3;

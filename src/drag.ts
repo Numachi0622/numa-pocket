@@ -253,13 +253,16 @@ export function attachDrag(board: HTMLElement, options: DragOptions, tuning: Dra
     if (findTouch(event.changedTouches, state.touchId) === null) return;
 
     if (state.kind === "dragging") {
+      // ドロップの後に click が来て、カードの編集欄が開かないようにする。
+      event.preventDefault();
+
       const target = columnAt(board, state.x, state.y);
       finish(target === null ? null : columnKeyOf(target));
       return;
     }
 
     finish(null);
-  });
+  }, { passive: false });
 
   board.addEventListener("touchcancel", () => finish(null));
 

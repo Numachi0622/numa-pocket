@@ -124,6 +124,20 @@ export function addCommitMessage(title: string, column: ColumnKey): string {
 }
 
 /**
+ * タスクの名前を変えたときのコミットメッセージ。
+ */
+export function renameCommitMessage(fromTitle: string, toTitle: string): string {
+  return `numa-pocket: ${fromTitle} → ${toTitle} (名前変更)`;
+}
+
+/**
+ * タスクを削除したときのコミットメッセージ。
+ */
+export function deleteCommitMessage(title: string): string {
+  return `numa-pocket: ${title} を削除`;
+}
+
+/**
  * タスクを列ごとに分ける。columnOf を渡すと、その列で振り分ける（保存中の移動を反映するため）。
  */
 export function groupByColumn(tasks: Task[], columnOf: (task: Task) => ColumnKey = (task) => task.column): Columns {

@@ -159,9 +159,9 @@ function toTransportError(error: unknown, kind: FetchErrorKind, context?: string
 
 /**
  * 書き込み失敗の種類。帯の文言と、取り直すかどうかはこの種類で決める。
- * conflict は取得した後にファイルが変わっていた（または消えていた）、unknownResult は通信が途切れて結果が分からない。
+ * conflict は取得した後にファイルが変わっていた（または消えていた）、exists はリネーム先の名前のファイルが既にあった、unknownResult は通信が途切れて結果が分からない。
  */
-export type SaveErrorKind = "conflict" | "auth" | "forbidden" | "rateLimit" | "unknownResult" | "unknown";
+export type SaveErrorKind = "conflict" | "exists" | "auth" | "forbidden" | "rateLimit" | "unknownResult" | "unknown";
 
 /**
  * 書き込み失敗を種類別に表すエラー。detail には原因を追うための情報（HTTP ステータスや応答の message）を入れる。トークンは入れない。
@@ -199,10 +199,188 @@ interface UpdateFileResponse {
  * 15 秒で打ち切る。失敗は SaveError に変換する。並列に呼ばないこと（GitHub のドキュメントが禁じている）。
  */
 export async function updateFile(settings: Settings, update: FileUpdate): Promise<{ sha: string }> {
-  let response: Response;
+  const body = { message: update.message, content: toBase64(update.content), ...(update.sha === undefined ? {} : { sha: update.sha }) };
+  const response = await sendWrite(settings, contentsUrl(settings, update.path), "PUT", body, "unknownResult");
+
+  const responseBody = await readUpdateBody(response);
+  const detail = `HTTP ${response.status}${responseBody?.message ? `: ${responseBody.message}` : ""}`;
+
+  if (response.ok) {
+    const sha = responseBody?.content?.sha;
+    if (typeof sha !== "string") throw new SaveError("unknown", `${detail}（応答に content.sha がありません）`);
+
+    return { sha };
+  }
+
+  throw new SaveError(saveErrorKindOf(response), detail);
+}
+
+/**
+ * 消すファイル。sha は取得したときの blob の sha で、GitHub 上のファイルがこれと違えば消されない。
+ */
+export interface FileDeletion {
+  path: string;
+  sha: string;
+  message: string;
+}
+
+/**
+ * REST の contents API（DELETE）で、デフォルトブランチのファイル 1 つを消すコミットを作る。
+ * 失敗の扱いは updateFile と同じ。並列に呼ばないこと。
+ */
+export async function deleteFile(settings: Settings, deletion: FileDeletion): Promise<void> {
+  const response = await sendWrite(settings, contentsUrl(settings, deletion.path), "DELETE", { message: deletion.message, sha: deletion.sha }, "unknownResult");
+  if (response.ok) return;
+
+  const responseBody = await readUpdateBody(response);
+  throw new SaveError(saveErrorKindOf(response), `HTTP ${response.status}${responseBody?.message ? `: ${responseBody.message}` : ""}`);
+}
+
+/**
+ * 名前を変えるファイル。content は今の本文（取得したバイト列と同じもの）、sha は取得したときの blob の sha。
+ */
+export interface FileRename {
+  fromPath: string;
+  toPath: string;
+  content: string;
+  sha: string;
+  message: string;
+}
+
+const RENAME_CHECK_QUERY = `
+query ($owner: String!, $name: String!, $from: String!, $to: String!) {
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef {
+      name
+      target {
+        ... on Commit {
+          oid
+          from: file(path: $from) { oid }
+          to: file(path: $to) { oid }
+        }
+      }
+    }
+  }
+}`;
+
+const RENAME_MUTATION = `
+mutation ($input: CreateCommitOnBranchInput!) {
+  createCommitOnBranch(input: $input) {
+    commit { oid }
+  }
+}`;
+
+const RENAME_ATTEMPTS = 2;
+
+interface RenameCheckResponse {
+  data?: {
+    repository: {
+      defaultBranchRef: {
+        name: string;
+        target: { oid?: string; from?: { oid: string } | null; to?: { oid: string } | null } | null;
+      } | null;
+    } | null;
+  } | null;
+  errors?: GraphQLError[];
+}
+
+interface RenameMutationResponse {
+  data?: { createCommitOnBranch: { commit: { oid: string } | null } | null } | null;
+  errors?: GraphQLError[];
+}
+
+/**
+ * GraphQL の createCommitOnBranch で、ファイルの追加（新しいパス）と削除（古いパス）を 1 コミットにまとめて名前を変える。
+ * 途中で失敗しても、新旧の両方が残る・両方とも消えることは無い。
+ * 先に先頭のコミットと両方のパスを確かめ、古いパスの blob が sha と違えば conflict、新しいパスにファイルがあれば exists にする。
+ * expectedHeadOid が食い違ったとき（その間に別の push があった）に備えて、確認からもう 1 回だけやり直す。並列に呼ばないこと。
+ */
+export async function renameFile(settings: Settings, rename: FileRename): Promise<void> {
+  let lastDetail = "";
+
+  for (let attempt = 0; attempt < RENAME_ATTEMPTS; attempt++) {
+    const head = await checkRename(settings, rename);
+
+    const body = await postWriteGraphQL<RenameMutationResponse>(settings, RENAME_MUTATION, {
+      input: {
+        branch: { repositoryNameWithOwner: `${settings.owner}/${settings.repo}`, branchName: head.branch },
+        message: { headline: rename.message },
+        expectedHeadOid: head.oid,
+        fileChanges: {
+          additions: [{ path: rename.toPath, contents: toBase64(rename.content) }],
+          deletions: [{ path: rename.fromPath }],
+        },
+      },
+    }, "unknownResult");
+
+    const errors = body.errors ?? [];
+    if (errors.length === 0 && body.data?.createCommitOnBranch?.commit) return;
+
+    lastDetail = graphQLDetail(errors, "commit が無い応答");
+    if (errors.some((error) => error.type === "FORBIDDEN")) throw new SaveError("forbidden", lastDetail);
+
+    console.warn(`[numa-pocket] 名前の変更のコミットに失敗しました（${attempt + 1} 回目）: ${lastDetail}`);
+  }
+
+  throw new SaveError("unknown", lastDetail);
+}
+
+async function checkRename(settings: Settings, rename: FileRename): Promise<{ branch: string; oid: string }> {
+  const body = await postWriteGraphQL<RenameCheckResponse>(settings, RENAME_CHECK_QUERY, {
+    owner: settings.owner,
+    name: settings.repo,
+    from: rename.fromPath,
+    to: rename.toPath,
+  }, "unknown");
+
+  const errors = body.errors ?? [];
+  if (errors.some((error) => error.type === "FORBIDDEN")) throw new SaveError("forbidden", graphQLDetail(errors, ""));
+  if (errors.length > 0) throw new SaveError("unknown", graphQLDetail(errors, ""));
+
+  const ref = body.data?.repository?.defaultBranchRef;
+  const target = ref?.target;
+  if (ref === null || ref === undefined || typeof target?.oid !== "string") {
+    throw new SaveError("unknown", "デフォルトブランチの先頭を取得できませんでした");
+  }
+
+  if (target.from?.oid !== rename.sha) {
+    throw new SaveError("conflict", target.from ? `${rename.fromPath} は取得した後に変わっています` : `${rename.fromPath} がありません`);
+  }
+
+  if (target.to) throw new SaveError("exists", `${rename.toPath} が既にあります`);
+
+  return { branch: ref.name, oid: target.oid };
+}
+
+async function postWriteGraphQL<T>(settings: Settings, query: string, variables: Record<string, unknown>, transportKind: SaveErrorKind): Promise<T> {
+  const response = await sendWrite(settings, GRAPHQL_ENDPOINT, "POST", { query, variables }, transportKind);
+
+  let body: T;
   try {
-    response = await fetch(contentsUrl(settings, update.path), {
-      method: "PUT",
+    body = (await response.json()) as T;
+  } catch (error) {
+    throw new SaveError(response.ok ? "unknown" : saveErrorKindOf(response), `HTTP ${response.status}: JSON として読めない応答 (${String(error)})`);
+  }
+
+  if (!response.ok) {
+    const message = (body as { message?: string } | null)?.message;
+    throw new SaveError(saveErrorKindOf(response), `HTTP ${response.status}${message ? `: ${message}` : ""}`);
+  }
+
+  return body;
+}
+
+function graphQLDetail(errors: GraphQLError[], fallback: string): string {
+  if (errors.length === 0) return fallback;
+
+  return errors.map((error) => `${error.type ?? "ERROR"}: ${error.message ?? "(message なし)"}`).join(" / ");
+}
+
+// 書き込み系のリクエストを送る。通信の失敗（タイムアウトを含む）は transportKind の SaveError にする。
+async function sendWrite(settings: Settings, url: string, method: string, body: unknown, transportKind: SaveErrorKind): Promise<Response> {
+  try {
+    return await fetch(url, {
+      method,
       cache: "no-store",
       signal: AbortSignal.timeout(TIMEOUT_MILLISECONDS),
       headers: {
@@ -210,27 +388,15 @@ export async function updateFile(settings: Settings, update: FileUpdate): Promis
         Accept: "application/vnd.github+json",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ message: update.message, content: toBase64(update.content), ...(update.sha === undefined ? {} : { sha: update.sha }) }),
+      body: JSON.stringify(body),
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === "TimeoutError") {
-      throw new SaveError("unknownResult", `${TIMEOUT_MILLISECONDS / 1000} 秒以内に応答がありませんでした`);
+      throw new SaveError(transportKind, `${TIMEOUT_MILLISECONDS / 1000} 秒以内に応答がありませんでした`);
     }
 
-    throw new SaveError("unknownResult", String(error));
+    throw new SaveError(transportKind, String(error));
   }
-
-  const body = await readUpdateBody(response);
-  const detail = `HTTP ${response.status}${body?.message ? `: ${body.message}` : ""}`;
-
-  if (response.ok) {
-    const sha = body?.content?.sha;
-    if (typeof sha !== "string") throw new SaveError("unknown", `${detail}（応答に content.sha がありません）`);
-
-    return { sha };
-  }
-
-  throw new SaveError(saveErrorKindOf(response), detail);
 }
 
 /**

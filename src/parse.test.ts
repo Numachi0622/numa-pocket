@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { FolderEntry } from "./github";
 import { gitBlobSha } from "./blob-sha";
-import { addCommitMessage, commitMessage, findWritableNames, groupByColumn, newTask, readRawStatus, readStatus, toTasks, type Task } from "./parse";
+import { addCommitMessage, commitMessage, deleteCommitMessage, findWritableNames, groupByColumn, newTask, readRawStatus, readStatus, renameCommitMessage, toTasks, type Task } from "./parse";
 
 function file(name: string, text: string | null, oid = "0000000000000000000000000000000000000000"): FolderEntry {
   return { name, type: "blob", oid, text };
@@ -225,5 +225,12 @@ describe("newTask", () => {
 describe("addCommitMessage", () => {
   it("元の位置に (新規) を置く", () => {
     expect(addCommitMessage("牛乳を買う", "today")).toBe("numa-pocket: 牛乳を買う (新規) → today");
+  });
+});
+
+describe("renameCommitMessage / deleteCommitMessage", () => {
+  it("古い名前 → 新しい名前 (名前変更)、タイトル を削除", () => {
+    expect(renameCommitMessage("牛乳を買う", "豆乳を買う")).toBe("numa-pocket: 牛乳を買う → 豆乳を買う (名前変更)");
+    expect(deleteCommitMessage("牛乳を買う")).toBe("numa-pocket: 牛乳を買う を削除");
   });
 });

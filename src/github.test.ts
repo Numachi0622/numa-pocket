@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SaveError, toBase64, updateFile, type FileUpdate } from "./github";
+import { deleteFile, renameFile, SaveError, toBase64, updateFile, type FileRename, type FileUpdate } from "./github";
 import type { Settings } from "./settings";
 
 const settings: Settings = { token: "test-token", owner: "owner", repo: "repo", folder: "Task/Data" };
@@ -17,6 +17,21 @@ function stubFetch(response: Response | Error): ReturnType<typeof vi.fn> {
   });
   vi.stubGlobal("fetch", fetchMock);
   return fetchMock;
+}
+
+function stubFetchSequence(responses: Response[]): ReturnType<typeof vi.fn> {
+  const fetchMock = vi.fn(async () => {
+    const next = responses.shift();
+    if (next === undefined) throw new Error("想定より多く fetch されました");
+    return next;
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+function requestBody(fetchMock: ReturnType<typeof vi.fn>, index: number): { variables?: Record<string, unknown> } {
+  const [, init] = fetchMock.mock.calls[index] as unknown as [string, RequestInit];
+  return JSON.parse(init.body as string);
 }
 
 function json(status: number, body: unknown, headers: Record<string, string> = {}): Response {
@@ -143,5 +158,124 @@ describe("updateFile", () => {
 
     expect(error.detail).not.toContain("test-token");
     expect(error.message).not.toContain("test-token");
+  });
+});
+
+describe("deleteFile", () => {
+  it("DELETE で message と sha を送る", async () => {
+    const fetchMock = stubFetch(json(200, { commit: { sha: "commit-sha" } }));
+
+    await deleteFile(settings, { path: update.path, sha: "ce013625030ba8dba906f756967f9e9ca394464a", message: "numa-pocket: 牛乳 を買う を削除" });
+
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.github.com/repos/owner/repo/contents/Task/Data/%E7%89%9B%E4%B9%B3%20%E3%82%92%E8%B2%B7%E3%81%86.md");
+    expect(init.method).toBe("DELETE");
+    expect(JSON.parse(init.body as string)).toEqual({ message: "numa-pocket: 牛乳 を買う を削除", sha: "ce013625030ba8dba906f756967f9e9ca394464a" });
+  });
+
+  it("409 / 404 / 422 は競合、通信エラーは結果不明", async () => {
+    for (const status of [409, 404, 422]) {
+      stubFetch(json(status, { message: "x" }));
+      expect((await saveErrorOf(deleteFile(settings, { path: update.path, sha: "ce013625030ba8dba906f756967f9e9ca394464a", message: "m" }))).kind).toBe("conflict");
+    }
+
+    stubFetch(new TypeError("Load failed"));
+    expect((await saveErrorOf(deleteFile(settings, { path: update.path, sha: "ce013625030ba8dba906f756967f9e9ca394464a", message: "m" }))).kind).toBe("unknownResult");
+  });
+});
+
+describe("renameFile", () => {
+  const rename: FileRename = {
+    fromPath: "Task/Data/牛乳 を買う.md",
+    toPath: "Task/Data/豆乳 を買う.md",
+    content: "---\nstatus: today\n---\n",
+    sha: "old-blob",
+    message: "numa-pocket: 牛乳 を買う → 豆乳 を買う (名前変更)",
+  };
+
+  function check(from: string | null, to: string | null, oid = "head-1"): Response {
+    return json(200, {
+      data: {
+        repository: {
+          defaultBranchRef: {
+            name: "main",
+            target: { oid, from: from === null ? null : { oid: from }, to: to === null ? null : { oid: to } },
+          },
+        },
+      },
+    });
+  }
+
+  const committed = () => json(200, { data: { createCommitOnBranch: { commit: { oid: "new-commit" } } } });
+  const stale = () => json(200, { data: { createCommitOnBranch: null }, errors: [{ type: "STALE_DATA", message: "Expected branch to point to head-1" }] });
+
+  it("先頭のコミットを確かめてから、追加と削除を 1 コミットで送る", async () => {
+    const fetchMock = stubFetchSequence([check("old-blob", null), committed()]);
+
+    await renameFile(settings, rename);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(requestBody(fetchMock, 0).variables).toEqual({ owner: "owner", name: "repo", from: rename.fromPath, to: rename.toPath });
+    expect(requestBody(fetchMock, 1).variables).toEqual({
+      input: {
+        branch: { repositoryNameWithOwner: "owner/repo", branchName: "main" },
+        message: { headline: rename.message },
+        expectedHeadOid: "head-1",
+        fileChanges: {
+          additions: [{ path: rename.toPath, contents: toBase64(rename.content) }],
+          deletions: [{ path: rename.fromPath }],
+        },
+      },
+    });
+  });
+
+  it("古いパスの blob が違う・無ければ競合で、コミットしない", async () => {
+    const changed = stubFetchSequence([check("other-blob", null)]);
+    expect((await saveErrorOf(renameFile(settings, rename))).kind).toBe("conflict");
+    expect(changed).toHaveBeenCalledTimes(1);
+
+    stubFetchSequence([check(null, null)]);
+    expect((await saveErrorOf(renameFile(settings, rename))).kind).toBe("conflict");
+  });
+
+  it("新しいパスにファイルがあれば exists で、コミットしない", async () => {
+    const fetchMock = stubFetchSequence([check("old-blob", "someone-else")]);
+
+    expect((await saveErrorOf(renameFile(settings, rename))).kind).toBe("exists");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("コミットがエラーを返したら、確認からもう 1 回だけやり直す", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const retried = stubFetchSequence([check("old-blob", null, "head-1"), stale(), check("old-blob", null, "head-2"), committed()]);
+    await renameFile(settings, rename);
+    expect((requestBody(retried, 3).variables?.input as { expectedHeadOid: string }).expectedHeadOid).toBe("head-2");
+
+    stubFetchSequence([check("old-blob", null), stale(), check("old-blob", null), stale()]);
+    const error = await saveErrorOf(renameFile(settings, rename));
+    expect(error.kind).toBe("unknown");
+    expect(error.detail).toContain("STALE_DATA");
+  });
+
+  it("FORBIDDEN は権限なしで、やり直さない", async () => {
+    const forbidden = json(200, { errors: [{ type: "FORBIDDEN", message: "Resource not accessible by personal access token" }] });
+    const fetchMock = stubFetchSequence([check("old-blob", null), forbidden]);
+
+    expect((await saveErrorOf(renameFile(settings, rename))).kind).toBe("forbidden");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("コミットの通信エラーは結果不明、確認の通信エラーは不明な失敗", async () => {
+    const responses: (Response | Error)[] = [check("old-blob", null), new TypeError("Load failed")];
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      const next = responses.shift();
+      if (next === undefined || next instanceof Error) throw next ?? new Error("想定より多く fetch されました");
+      return next;
+    }));
+    expect((await saveErrorOf(renameFile(settings, rename))).kind).toBe("unknownResult");
+
+    stubFetch(new TypeError("Load failed"));
+    expect((await saveErrorOf(renameFile(settings, rename))).kind).toBe("unknown");
   });
 });

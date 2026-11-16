@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isSameName, validateTitle } from "./task-title";
+import { isSameName, validateRename, validateTitle } from "./task-title";
 
 describe("validateTitle", () => {
   it("前後の空白を除いて、ファイル名を付けて返す", () => {
@@ -41,5 +41,21 @@ describe("isSameName", () => {
     expect(isSameName("A.md", "a.md")).toBe(true);
     expect(isSameName("が.md", "が.md")).toBe(true);
     expect(isSameName("a.md", "b.md")).toBe(false);
+  });
+});
+
+describe("validateRename", () => {
+  it("自分自身とは重複扱いせず、他のタスクとの重複は弾く", () => {
+    expect(validateRename("豆乳", "牛乳.md", ["牛乳.md", "卵.md"])).toEqual({ ok: true, title: "豆乳", name: "豆乳.md" });
+    expect(validateRename("卵", "牛乳.md", ["牛乳.md", "卵.md"])).toEqual({ ok: false, reason: "同じ名前のタスクがあります" });
+  });
+
+  it("大文字・小文字だけの変更は弾く", () => {
+    expect(validateRename("Milk", "milk.md", ["milk.md"])).toEqual({ ok: false, reason: "大文字・小文字だけの変更はできません" });
+  });
+
+  it("validateTitle と同じく、空・使えない文字を弾く", () => {
+    expect(validateRename("  ", "a.md", ["a.md"])).toEqual({ ok: false, reason: null });
+    expect(validateRename("a/b", "a.md", ["a.md"]).ok).toBe(false);
   });
 });

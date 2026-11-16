@@ -1,14 +1,14 @@
 import "./style.css";
-import { createBoard, type AddResult, type BoardView } from "./board";
+import { createBoard, type BoardView, type EditTarget, type SubmitResult } from "./board";
 import { attachDrag, type DragHandle } from "./drag";
 import { DEFAULT_DRAG_TUNING, DRAG_TUNING_FIELDS, loadDragTuning, parseDragTuning, saveDragTuning, type DragTuning } from "./drag-tuning";
 import { withStatus } from "./frontmatter";
-import { FetchError, fetchFolderEntries, isAbortError, SaveError, updateFile, type FetchErrorKind, type SaveErrorKind } from "./github";
-import { addCommitMessage, commitMessage, findWritableNames, groupByColumn, newTask, toTasks, type ColumnKey, type Task } from "./parse";
+import { deleteFile, FetchError, fetchFolderEntries, isAbortError, renameFile, SaveError, updateFile, type FetchErrorKind, type SaveErrorKind } from "./github";
+import { addCommitMessage, commitMessage, deleteCommitMessage, findWritableNames, groupByColumn, newTask, renameCommitMessage, toTasks, type ColumnKey, type Task } from "./parse";
 import { attachPullToRefresh, type PullIndicator } from "./pull-to-refresh";
 import { createSaveQueue } from "./save-queue";
 import { isComplete, loadSettings, normalizeFolder, saveSettings, type Settings } from "./settings";
-import { isSameName, validateTitle } from "./task-title";
+import { isSameName, validateRename, validateTitle } from "./task-title";
 
 const ERROR_MESSAGES: Record<FetchErrorKind, string> = {
   network: "通信できませんでした",
@@ -22,6 +22,7 @@ const ERROR_MESSAGES: Record<FetchErrorKind, string> = {
 
 const SAVE_ERROR_MESSAGES: Record<SaveErrorKind, string> = {
   conflict: "他の端末で変更されていたので、保存せずに取り直しました",
+  exists: "同じ名前のタスクが GitHub にあったので、変更せずに取り直しました",
   auth: "トークンが無効か期限切れのため保存できませんでした",
   forbidden: "トークンに書き込み権限が無いため保存できませんでした",
   rateLimit: "GitHub の利用制限に達したため保存できませんでした",
@@ -51,7 +52,24 @@ interface AddJob {
   task: Task & { text: string };
 }
 
-type SaveJob = MoveJob | AddJob;
+/**
+ * 保存待ちの名前の変更。from は編集欄を開いた時点のタスク、to は新しい名前にしたタスク（sha・本文・列は from と同じ）。
+ */
+interface RenameJob {
+  kind: "rename";
+  from: Task & { text: string };
+  to: Task & { text: string };
+}
+
+/**
+ * 保存待ちの削除。削除を押した時点のタスク（sha）を写して持つ。
+ */
+interface DeleteJob {
+  kind: "delete";
+  task: Task;
+}
+
+type SaveJob = MoveJob | AddJob | RenameJob | DeleteJob;
 
 interface MainScreen {
   content: HTMLElement;
@@ -71,14 +89,28 @@ let mainScreen: MainScreen | null = null;
 let board: BoardView | null = null;
 let drag: DragHandle | null = null;
 
-// 画面の元になる状態。ボードは「tasks の列を pending（保存中の移動。ファイル名 → 移動先）で上書きし、pendingAdds（保存中の追加）を足したもの」を描く。
+// 画面の元になる状態。ボードは tasks に、保存中の操作を重ねたものを描く（visibleTasks を参照）。
+// pending: 移動（ファイル名 → 移動先）、pendingAdds: 追加、pendingRenames: 名前の変更（古いファイル名 → 新しい名前のタスク）、pendingDeletes: 削除。
 let tasks: Task[] | null = null;
 const pending = new Map<string, ColumnKey>();
 const pendingAdds = new Map<string, Task & { text: string }>();
+const pendingRenames = new Map<string, Task & { text: string }>();
+const pendingDeletes = new Set<string>();
 let needsRender = false;
 let noticeTimer: number | null = null;
 
-const saveQueue = createSaveQueue<SaveJob>((job) => (job.kind === "move" ? saveMove(job) : saveAdd(job)));
+const saveQueue = createSaveQueue<SaveJob>((job) => {
+  switch (job.kind) {
+    case "move":
+      return saveMove(job);
+    case "add":
+      return saveAdd(job);
+    case "rename":
+      return saveRename(job);
+    case "delete":
+      return saveDelete(job);
+  }
+});
 
 // 取得中に次のトリガーが来たら前の取得を中断し、連番が最新の取得の結果だけを画面に反映する。
 let latestRequestId = 0;
@@ -200,11 +232,11 @@ function renderTasks(screen: MainScreen): void {
 
   const view = board ?? mountBoard(screen);
   const columns = groupByColumn(visibleTasks(), (task) => pending.get(task.name) ?? task.column);
-  view.update(columns, new Set([...pending.keys(), ...pendingAdds.keys()]));
+  view.update(columns, savingNames());
 }
 
 function mountBoard(screen: MainScreen): BoardView {
-  const view = createBoard({ onAdd: addTask });
+  const view = createBoard({ onAdd: addTask, editTargetOf, onRename: renameTask, onDelete: deleteTask });
   screen.content.replaceChildren(view.element);
   view.showColumn("today");
 
@@ -223,15 +255,47 @@ function mountBoard(screen: MainScreen): BoardView {
   return view;
 }
 
-// 保存中の追加は一番下に出す。取得で同じファイルが先に届いていたら、保存が終わるまで保存中の方を出す。
+// 名前を変えている途中のタスクは元の位置に新しい名前で、保存中の追加は一番下に出し、削除している途中のタスクは出さない。
+// 取得で新しい名前・追加したファイルが先に届いていたら、保存が終わるまで保存中の方を出す。
 function visibleTasks(): Task[] {
-  const fetched = (tasks ?? []).filter((task) => !pendingAdds.has(task.name));
-  return [...fetched, ...pendingAdds.values()];
+  const renamedNames = new Set([...pendingRenames.values()].map((task) => task.name));
+  const placedRenames = new Set<string>();
+  const shown: Task[] = [];
+
+  for (const task of tasks ?? []) {
+    if (pendingAdds.has(task.name) || pendingDeletes.has(task.name) || renamedNames.has(task.name)) continue;
+
+    const renamed = pendingRenames.get(task.name);
+    if (renamed !== undefined) {
+      placedRenames.add(task.name);
+      shown.push(renamed);
+      continue;
+    }
+
+    shown.push(task);
+  }
+
+  for (const [fromName, renamed] of pendingRenames) {
+    if (!placedRenames.has(fromName)) {
+      shown.push(renamed);
+    }
+  }
+
+  return [...shown, ...pendingAdds.values()];
+}
+
+function savingNames(): Set<string> {
+  const renamedNames = [...pendingRenames.values()].map((task) => task.name);
+  return new Set([...pending.keys(), ...pendingAdds.keys(), ...renamedNames]);
+}
+
+function isSaving(name: string): boolean {
+  return savingNames().has(name) || pendingRenames.has(name) || pendingDeletes.has(name);
 }
 
 // 保存中のカードと、本文をそのまま書き戻せないカード（findWritableNames を参照）は持ち上げない。
 function canLift(name: string): boolean {
-  if (pending.has(name) || pendingAdds.has(name)) return false;
+  if (isSaving(name)) return false;
 
   const task = tasks?.find((candidate) => candidate.name === name);
   if (task === undefined) return false;
@@ -254,18 +318,61 @@ function moveTask(screen: MainScreen, name: string, to: ColumnKey): void {
   saveQueue.push({ kind: "move", task: { ...task, text: task.text }, to });
 }
 
-function addTask(column: ColumnKey, rawTitle: string): AddResult {
-  if (settings === null || tasks === null) return { added: false, reason: "ボードを取得してから追加してください" };
+function addTask(column: ColumnKey, rawTitle: string): SubmitResult {
+  if (settings === null || tasks === null) return { done: false, reason: "ボードを取得してから追加してください" };
 
   const check = validateTitle(rawTitle, visibleTasks().map((task) => task.name));
-  if (!check.ok) return { added: false, reason: check.reason };
+  if (!check.ok) return { done: false, reason: check.reason };
 
   const task = newTask(settings.folder, check.title, column);
   pendingAdds.set(task.name, task);
   rerender();
 
   saveQueue.push({ kind: "add", task });
-  return { added: true, reason: null };
+  return { done: true, reason: null };
+}
+
+// 保存中のカードは編集欄を開かない。本文を書き戻せないカードは開くが、保存・削除はできない。
+function editTargetOf(name: string): EditTarget | null {
+  if (isSaving(name)) return null;
+
+  const task = tasks?.find((candidate) => candidate.name === name);
+  if (task === undefined) return null;
+
+  return { title: task.title, writable: isWritable(task) };
+}
+
+function isWritable(task: Task): task is Task & { text: string } {
+  return task.writable && task.text !== null;
+}
+
+function renameTask(name: string, rawTitle: string): SubmitResult {
+  const task = tasks?.find((candidate) => candidate.name === name);
+  if (task === undefined || isSaving(name)) return { done: false, reason: "このタスクは今は変更できません" };
+  if (!isWritable(task)) return { done: false, reason: null };
+
+  if (rawTitle.trim() === task.title) return { done: true, reason: null };
+
+  const check = validateRename(rawTitle, name, visibleTasks().map((candidate) => candidate.name));
+  if (!check.ok) return { done: false, reason: check.reason };
+
+  const folderPrefix = task.path.slice(0, task.path.length - task.name.length);
+  const renamed: Task & { text: string } = { ...task, name: check.name, title: check.title, path: `${folderPrefix}${check.name}` };
+  pendingRenames.set(name, renamed);
+  rerender();
+
+  saveQueue.push({ kind: "rename", from: task, to: renamed });
+  return { done: true, reason: null };
+}
+
+function deleteTask(name: string): void {
+  const task = tasks?.find((candidate) => candidate.name === name);
+  if (task === undefined || isSaving(name) || !isWritable(task)) return;
+
+  pendingDeletes.add(name);
+  rerender();
+
+  saveQueue.push({ kind: "delete", task });
 }
 
 async function saveMove(job: MoveJob): Promise<void> {
@@ -336,6 +443,72 @@ async function saveAdd(job: AddJob): Promise<void> {
       notify(exists ? DUPLICATE_ADD_MESSAGE : SAVE_ERROR_MESSAGES.unknown, detail);
     });
   }
+}
+
+async function saveRename(job: RenameJob): Promise<void> {
+  const { from, to } = job;
+
+  try {
+    if (settings === null) throw new SaveError("unknown", "設定がありません");
+
+    await renameFile(settings, { fromPath: from.path, toPath: to.path, content: from.text, sha: from.sha, message: renameCommitMessage(from.title, to.title) });
+
+    pendingRenames.delete(from.name);
+    tasks = replaceRenamed(tasks, from.name, { ...to, writable: true });
+    rerender();
+
+    if (inFlight !== null) {
+      void refresh();
+    }
+  } catch (error) {
+    pendingRenames.delete(from.name);
+    handleSaveFailure(error, `${from.name} の名前を変えられませんでした`);
+  }
+}
+
+async function saveDelete(job: DeleteJob): Promise<void> {
+  const { task } = job;
+
+  try {
+    if (settings === null) throw new SaveError("unknown", "設定がありません");
+
+    await deleteFile(settings, { path: task.path, sha: task.sha, message: deleteCommitMessage(task.title) });
+
+    pendingDeletes.delete(task.name);
+    tasks = tasks?.filter((candidate) => candidate.name !== task.name) ?? null;
+    rerender();
+
+    if (inFlight !== null) {
+      void refresh();
+    }
+  } catch (error) {
+    pendingDeletes.delete(task.name);
+    handleSaveFailure(error, `${task.name} を削除できませんでした`);
+  }
+}
+
+// 画面を保存前に戻して知らせる。他の端末の変更とぶつかったときは取り直す。
+function handleSaveFailure(error: unknown, logMessage: string): void {
+  const kind: SaveErrorKind = error instanceof SaveError ? error.kind : "unknown";
+  const detail = error instanceof SaveError ? error.detail : String(error);
+  console.error(`[numa-pocket] ${logMessage}`, error);
+
+  rerender();
+  notify(SAVE_ERROR_MESSAGES[kind], detail);
+
+  if (kind === "conflict" || kind === "exists") {
+    void refresh();
+  }
+}
+
+// 古い名前のタスクを新しい名前のタスクに置き換える。取得で新しい名前が先に届いていたらそちらは除き、古い名前が無ければ末尾に足す。
+function replaceRenamed(current: Task[] | null, fromName: string, renamed: Task): Task[] | null {
+  if (current === null) return null;
+
+  const others = current.filter((candidate) => candidate.name !== renamed.name);
+  if (!others.some((candidate) => candidate.name === fromName)) return [...others, renamed];
+
+  return others.map((candidate) => (candidate.name === fromName ? renamed : candidate));
 }
 
 function replaceOrAppend(current: Task[] | null, task: Task): Task[] | null {
