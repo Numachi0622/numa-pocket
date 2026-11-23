@@ -2,12 +2,15 @@ import "./style.css";
 import { createBoard, type BoardView, type EditTarget, type SubmitResult } from "./board";
 import { attachDrag, type DragHandle } from "./drag";
 import { DEFAULT_DRAG_TUNING, DRAG_TUNING_FIELDS, loadDragTuning, parseDragTuning, saveDragTuning, type DragTuning } from "./drag-tuning";
+import { DEFAULT_COLUMN_WIDTH, loadColumnWidth, parseColumnWidth, saveColumnWidth } from "./layout";
 import { withStatus } from "./frontmatter";
-import { deleteFile, FetchError, fetchFolderEntries, isAbortError, renameFile, SaveError, updateFile, type FetchErrorKind, type SaveErrorKind } from "./github";
+import { FetchError, isAbortError, SaveError, type FetchErrorKind, type SaveErrorKind } from "./github";
 import { addCommitMessage, commitMessage, deleteCommitMessage, findWritableNames, groupByColumn, newTask, renameCommitMessage, toTasks, type ColumnKey, type Task } from "./parse";
 import { attachPullToRefresh, type PullIndicator } from "./pull-to-refresh";
 import { createSaveQueue } from "./save-queue";
-import { isComplete, loadSettings, normalizeFolder, saveSettings, type Settings } from "./settings";
+import { normalizeFolder } from "./settings";
+import { isWorkspaceComplete, loadWorkspaces, saveWorkspaces, type Workspace } from "./workspaces";
+import { fetchFolderEntries, updateFile, renameFile, deleteFile } from "./storage";
 import { isSameName, validateRename, validateTitle } from "./task-title";
 
 const ERROR_MESSAGES: Record<FetchErrorKind, string> = {
@@ -22,7 +25,7 @@ const ERROR_MESSAGES: Record<FetchErrorKind, string> = {
 
 const SAVE_ERROR_MESSAGES: Record<SaveErrorKind, string> = {
   conflict: "他の端末で変更されていたので、保存せずに取り直しました",
-  exists: "同じ名前のタスクが GitHub にあったので、変更せずに取り直しました",
+  exists: "保存先に同じ名前のタスクがあったので、変更せずに取り直しました",
   auth: "トークンが無効か期限切れのため保存できませんでした",
   forbidden: "トークンに書き込み権限が無いため保存できませんでした",
   rateLimit: "GitHub の利用制限に達したため保存できませんでした",
@@ -30,7 +33,7 @@ const SAVE_ERROR_MESSAGES: Record<SaveErrorKind, string> = {
   unknown: "保存できませんでした",
 };
 
-const DUPLICATE_ADD_MESSAGE = "同じ名前のタスクが GitHub にあったので、追加せずに取り直しました";
+const DUPLICATE_ADD_MESSAGE = "保存先に同じ名前のタスクがあったので、追加せずに取り直しました";
 
 const NOTICE_MILLISECONDS = 4_000;
 
@@ -83,8 +86,10 @@ const root = document.querySelector<HTMLDivElement>("#app");
 if (root === null) throw new Error("#app が見つかりません");
 const app: HTMLDivElement = root;
 
-let settings: Settings | null = loadSettings();
+let workspaceSettings = loadWorkspaces();
+let settings: Workspace | null = workspaceSettings.workspaces.find((workspace) => workspace.id === workspaceSettings.activeId) ?? null;
 let dragTuning: DragTuning = loadDragTuning();
+let columnWidth = loadColumnWidth();
 let mainScreen: MainScreen | null = null;
 let board: BoardView | null = null;
 let drag: DragHandle | null = null;
@@ -128,7 +133,7 @@ function start(): void {
     drag?.cancel();
   });
 
-  if (settings === null || !isComplete(settings)) {
+  if (settings === null || !isWorkspaceComplete(settings)) {
     showSettings();
     return;
   }
@@ -186,6 +191,8 @@ function cancelInFlight(): number {
 }
 
 function showMain(): void {
+  app.style.setProperty("--desktop-column-width", `${columnWidth}px`);
+
   const header = element("header", "header");
   const refreshing = element("span", "refreshing", "更新中...");
   refreshing.hidden = true;
@@ -193,9 +200,50 @@ function showMain(): void {
   const settingsButton = element("button", "secondary", "設定");
   settingsButton.addEventListener("click", showSettings);
 
-  const titleGroup = element("div", "title-group");
-  titleGroup.append(element("h1", "title", "numa-pocket"), refreshing);
+  const titleGroup = element("div", "title-group workspace-title-group");
+  titleGroup.append(element("span", "app-name", "numa-pocket"), element("h1", "title", settings?.label ?? "タスク"), refreshing);
   header.append(titleGroup, settingsButton);
+
+  const workspaceRail = element("nav", "workspace-rail");
+  workspaceRail.setAttribute("aria-label", "ワークスペース");
+  for (const workspace of workspaceSettings.workspaces) {
+    const button = element("button", "workspace-tab");
+    button.type = "button";
+    button.title = workspace.label;
+    button.setAttribute("aria-label", workspace.label);
+    button.dataset.workspaceId = workspace.id;
+    const active = workspace.id === settings?.id;
+    if (active) button.setAttribute("aria-current", "true");
+
+    const badge = element("span", "workspace-badge", Array.from(workspace.label).slice(0, 2).join(""));
+    badge.setAttribute("aria-hidden", "true");
+    const label = element("span", "workspace-tab-label", workspace.label);
+    label.setAttribute("aria-hidden", "true");
+    button.append(badge, label);
+    button.addEventListener("click", () => {
+      if (workspace.id === settings?.id) return;
+      if (hasPendingSaves()) {
+        notify("保存が終わってからワークスペースを切り替えてください", "");
+        return;
+      }
+
+      const next = { ...workspaceSettings, activeId: workspace.id };
+      try {
+        saveWorkspaces(next);
+      } catch (error) {
+        notify("ワークスペースの選択を保存できませんでした", String(error));
+        return;
+      }
+
+      cancelInFlight();
+      workspaceSettings = next;
+      settings = workspace;
+      showMain();
+      app.querySelector<HTMLElement>('.workspace-tab[aria-current="true"]')?.focus({ preventScroll: true });
+      void refresh();
+    });
+    workspaceRail.append(button);
+  }
 
   const pull = element("div", "pull-indicator");
   const pullLabel = element("span", "pull-label");
@@ -212,7 +260,12 @@ function showMain(): void {
   const noticeDetail = element("p", "notice-detail");
   notice.append(noticeMessage, noticeDetail);
 
-  app.replaceChildren(header, pull, notice, content);
+  const panel = element("div", "main-panel");
+  panel.append(header, pull, notice, content);
+  const shell = element("div", "workspace-shell");
+  shell.append(workspaceRail, panel);
+  app.replaceChildren(shell);
+  workspaceRail.querySelector('[aria-current="true"]')?.scrollIntoView({ block: "nearest", inline: "nearest" });
   mainScreen = { content, refreshing, notice, noticeMessage, noticeDetail };
   resetBoard();
 
@@ -238,7 +291,7 @@ function renderTasks(screen: MainScreen): void {
 function mountBoard(screen: MainScreen): BoardView {
   const view = createBoard({ onAdd: addTask, editTargetOf, onRename: renameTask, onDelete: deleteTask });
   screen.content.replaceChildren(view.element);
-  view.showColumn("today");
+  view.showColumn(window.matchMedia("(min-width: 768px)").matches ? "idea" : "today");
 
   board = view;
   drag = attachDrag(view.element, {
@@ -400,7 +453,7 @@ async function saveMove(job: MoveJob): Promise<void> {
     console.error(`[numa-pocket] ${task.name} を保存できませんでした`, error);
 
     rerender();
-    notify(SAVE_ERROR_MESSAGES[kind], detail);
+    notify(saveErrorMessage(kind), detail);
 
     if (kind === "conflict") {
       void refresh();
@@ -433,14 +486,14 @@ async function saveAdd(job: AddJob): Promise<void> {
     rerender();
 
     if (kind !== "conflict") {
-      notify(SAVE_ERROR_MESSAGES[kind], detail);
+      notify(saveErrorMessage(kind), detail);
       return;
     }
 
     // 競合に寄せている 409 / 404 / 422 のどれが返ったかでは同名かどうかを決めきれないので、取り直して確かめる。
     void refresh().then(() => {
       const exists = tasks?.some((candidate) => isSameName(candidate.name, task.name)) ?? false;
-      notify(exists ? DUPLICATE_ADD_MESSAGE : SAVE_ERROR_MESSAGES.unknown, detail);
+      notify(exists ? DUPLICATE_ADD_MESSAGE : saveErrorMessage("unknown"), detail);
     });
   }
 }
@@ -494,7 +547,7 @@ function handleSaveFailure(error: unknown, logMessage: string): void {
   console.error(`[numa-pocket] ${logMessage}`, error);
 
   rerender();
-  notify(SAVE_ERROR_MESSAGES[kind], detail);
+  notify(saveErrorMessage(kind), detail);
 
   if (kind === "conflict" || kind === "exists") {
     void refresh();
@@ -574,43 +627,117 @@ function showError(screen: MainScreen, error: unknown): void {
   screen.content.replaceChildren(section);
 }
 
+function saveErrorMessage(kind: SaveErrorKind): string {
+  if (settings?.kind === "local") {
+    if (kind === "conflict") return "ファイルが変更・移動されていたので、保存せずに取り直しました";
+    if (kind === "forbidden") return "フォルダまたはファイルへのアクセス権限がないため保存できませんでした";
+  }
+
+  return SAVE_ERROR_MESSAGES[kind];
+}
+
+function hasPendingSaves(): boolean {
+  return pending.size + pendingAdds.size + pendingRenames.size + pendingDeletes.size > 0;
+}
+
 function showSettings(): void {
+  if (hasPendingSaves()) {
+    notify("保存が終わってから設定を開いてください", "");
+    return;
+  }
+
   cancelInFlight();
   mainScreen = null;
   resetBoard();
 
-  const current = settings;
   const form = element("form", "settings");
   form.append(element("h1", "title", "設定"));
+  const editors = element("div", "workspace-editors");
+  const drafts = workspaceSettings.workspaces.map((workspace) => ({ ...workspace }));
+  const readDrafts: (() => Workspace)[] = [];
+  let activeId = settings?.id ?? "";
 
-  const tokenInput = input("token", "password", "");
-  tokenInput.placeholder = current?.token ? "保存済み（変更するときだけ入力）" : "github_pat_...";
-  tokenInput.autocomplete = "off";
+  function appendEditor(draft: Workspace): void {
+    const section = element("fieldset", "tuning workspace-editor");
+    section.append(element("legend", "tuning-legend", "ワークスペース"));
+    const labelInput = input("label", "text", draft.label);
+    const kindInput = element("select", "field-input");
+    for (const [value, label] of [["github", "GitHub"], ["local", "ローカルフォルダ"]]) {
+      const option = element("option", "", label);
+      option.value = value;
+      option.selected = value === draft.kind;
+      kindInput.append(option);
+    }
 
-  const ownerInput = input("owner", "text", current?.owner ?? "");
-  ownerInput.placeholder = "GitHub のユーザー名";
+    const tokenInput = input("token", "password", "");
+    tokenInput.placeholder = draft.token ? "保存済み（変更するときだけ入力）" : "github_pat_...";
+    tokenInput.autocomplete = "off";
+    const ownerInput = input("owner", "text", draft.owner);
+    const repoInput = input("repo", "text", draft.repo);
+    const githubFields = element("div", "workspace-fields");
+    githubFields.append(field("トークン（Contents: Read and write）", tokenInput), field("owner", ownerInput), field("repo", repoInput));
+    const folderInput = input("folder", "text", draft.folder);
+    const hint = element("p", "workspace-hint");
+    const updateKind = (): void => {
+      githubFields.hidden = kindInput.value === "local";
+      folderInput.placeholder = kindInput.value === "local" ? "/Users/名前/タスク または C:\\Tasks" : "Task/Data";
+      hint.textContent = kindInput.value === "local"
+        ? "npm run local で起動し、この PC のフォルダの絶対パスを指定。直下の .md を読み書きします。Git へのコミットは行いません。"
+        : "デフォルトブランチの指定フォルダ直下を読み書きします。";
+    };
+    kindInput.addEventListener("change", updateKind);
+    updateKind();
+    section.append(field("名前", labelInput), field("保存先", kindInput), githubFields, field("フォルダパス", folderInput), hint);
 
-  const repoInput = input("repo", "text", current?.repo ?? "");
-  repoInput.placeholder = "リポジトリ名";
+    const remove = element("button", "secondary", "登録を外す");
+    remove.type = "button";
+    let removed = false;
+    remove.addEventListener("click", () => {
+      removed = true;
+      section.remove();
+    });
+    section.append(remove);
+    editors.append(section);
+    readDrafts.push(() => ({
+      id: removed ? "" : draft.id,
+      label: labelInput.value.trim(),
+      kind: kindInput.value === "local" ? "local" : "github",
+      token: tokenInput.value.trim() || draft.token,
+      owner: ownerInput.value.trim(),
+      repo: repoInput.value.trim(),
+      folder: kindInput.value === "local" ? folderInput.value.trim() : normalizeFolder(folderInput.value),
+    }));
+  }
 
-  const folderInput = input("folder", "text", current?.folder ?? "");
-  folderInput.placeholder = "フォルダ/パス";
+  const add = (): void => {
+    const draft: Workspace = { id: crypto.randomUUID(), label: "", kind: "local", token: "", owner: "", repo: "", folder: "" };
+    if (!activeId) activeId = draft.id;
 
-  form.append(
-    field("トークン（Fine-grained PAT, Contents: Read and write）", tokenInput),
-    field("owner", ownerInput),
-    field("repo", repoInput),
-    field("フォルダパス", folderInput),
-  );
+    appendEditor(draft);
+  };
+  for (const draft of drafts) {
+    appendEditor(draft);
+  }
+  if (drafts.length === 0) add();
 
+  const addButton = element("button", "secondary", "＋ ワークスペースを追加");
+  addButton.type = "button";
+  addButton.addEventListener("click", add);
+  form.append(editors, addButton);
+  const widthInput = input("columnWidth", "number", String(columnWidth));
+  widthInput.min = "160";
+  widthInput.max = "800";
+  widthInput.step = "1";
+  form.append(field(`PC の列幅（px、160〜800、初期値 ${DEFAULT_COLUMN_WIDTH}）`, widthInput));
+  form.append(element("p", "workspace-hint", "画面幅768px以上に適用。スマホは2列表示。マウスは押して移動、タッチは長押しでドラッグできます。"));
   const tuningInputs = tuningSection(form, dragTuning);
-
   const message = element("p", "form-message");
+  message.setAttribute("role", "alert");
   const submit = element("button", "primary", "保存");
   submit.type = "submit";
   form.append(message, submit);
 
-  if (current !== null && isComplete(current)) {
+  if (settings !== null && isWorkspaceComplete(settings)) {
     const cancel = element("button", "secondary", "キャンセル");
     cancel.type = "button";
     cancel.addEventListener("click", () => {
@@ -622,17 +749,16 @@ function showSettings(): void {
 
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-
+    const workspaces = readDrafts.map((read) => read()).filter((workspace) => workspace.id !== "");
     const parsedTuning = parseDragTuning(tuningInputsValues(tuningInputs));
-    const next: Settings = {
-      token: tokenInput.value.trim() || current?.token || "",
-      owner: ownerInput.value.trim(),
-      repo: repoInput.value.trim(),
-      folder: normalizeFolder(folderInput.value),
-    };
+    const nextWidth = parseColumnWidth(widthInput.value);
+    if (nextWidth === null) {
+      message.textContent = "PC の列幅は160〜800pxの整数にしてください";
+      return;
+    }
 
-    if (!isComplete(next)) {
-      message.textContent = "4 項目すべてを入力してください";
+    if (workspaces.length === 0 || workspaces.some((workspace) => !isWorkspaceComplete(workspace))) {
+      message.textContent = "ワークスペースを1つ以上登録し、名前と保存先に必要な項目を入力してください";
       return;
     }
 
@@ -641,10 +767,21 @@ function showSettings(): void {
       return;
     }
 
-    saveSettings(next);
-    settings = next;
-    saveDragTuning(parsedTuning.tuning);
+    const next = { workspaces, activeId: workspaces.some((workspace) => workspace.id === activeId) ? activeId : workspaces[0].id };
+    try {
+      saveColumnWidth(nextWidth);
+      saveDragTuning(parsedTuning.tuning);
+      saveWorkspaces(next);
+    } catch (error) {
+      console.error("[numa-pocket] 設定を保存できませんでした", error);
+      message.textContent = "設定を保存できませんでした。ブラウザの保存領域を確認してください";
+      return;
+    }
+
+    workspaceSettings = next;
+    settings = workspaces.find((workspace) => workspace.id === next.activeId) ?? null;
     dragTuning = parsedTuning.tuning;
+    columnWidth = nextWidth;
     showMain();
     void refresh();
   });
@@ -713,7 +850,7 @@ function pullIndicator(container: HTMLElement, label: HTMLElement): PullIndicato
   };
 }
 
-function field(label: string, control: HTMLInputElement): HTMLLabelElement {
+function field(label: string, control: HTMLInputElement | HTMLSelectElement): HTMLLabelElement {
   const wrapper = element("label", "field");
   wrapper.append(element("span", "field-label", label), control);
   return wrapper;

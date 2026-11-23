@@ -3,6 +3,7 @@ import type { ColumnKey } from "./parse";
 
 const SLIDE_SETTLE_MS = 400;
 const LIFT_SCALE = 1.05;
+const MOUSE_DRAG_THRESHOLD_PX = 4;
 
 /**
  * ドラッグが呼び出し側に問い合わせ・通知すること。
@@ -31,6 +32,7 @@ interface Pressing {
   kind: "pressing";
   card: HTMLElement;
   touchId: number;
+  input: "touch" | "mouse";
   startX: number;
   startY: number;
   timer: number;
@@ -41,6 +43,7 @@ interface Dragging {
   card: HTMLElement;
   ghost: HTMLElement;
   touchId: number;
+  input: "touch" | "mouse";
   grabOffsetX: number;
   grabOffsetY: number;
   originLeft: number;
@@ -57,6 +60,7 @@ interface Dragging {
 type DragState = { kind: "idle" } | Pressing | Dragging;
 
 /**
+ * マウスは押して移動、タッチは長押しでカードを持ち上げる。
  * board の中のカード（.card[data-name]）を長押しで持ち上げ、別の列（.column[data-column]）へドラッグ＆ドロップできるようにする。
  * 長押しが成立する前に指が動いたら何もせず、標準のスクロール・横スワイプ・引っ張って更新に任せる。
  * ドラッグ中は touchmove を止め、指が左右の端のゾーンに一定時間留まったら options.slide で 1 列分スライドする。
@@ -64,8 +68,19 @@ type DragState = { kind: "idle" } | Pressing | Dragging;
  */
 export function attachDrag(board: HTMLElement, options: DragOptions, tuning: DragTuning): DragHandle {
   let state: DragState = { kind: "idle" };
+  let suppressMouseClick = false;
+
+  const removeMouseListeners = () => {
+    window.removeEventListener("pointermove", onMouseMove);
+    window.removeEventListener("pointerup", onMouseUp);
+    window.removeEventListener("pointercancel", onMouseCancel);
+    window.removeEventListener("blur", onMouseCancel);
+    window.removeEventListener("keydown", onKeyDown);
+  };
 
   const finish = (dropTo: ColumnKey | null) => {
+    removeMouseListeners();
+
     if (state.kind === "pressing") {
       window.clearTimeout(state.timer);
       state = { kind: "idle" };
@@ -75,6 +90,10 @@ export function attachDrag(board: HTMLElement, options: DragOptions, tuning: Dra
     if (state.kind !== "dragging") return;
 
     const dragging = state;
+    if (dragging.input === "mouse") {
+      suppressMouseClick = true;
+    }
+
     state = { kind: "idle" };
 
     if (dragging.edgeTimer !== null) {
@@ -120,6 +139,7 @@ export function attachDrag(board: HTMLElement, options: DragOptions, tuning: Dra
       card,
       ghost,
       touchId: pressing.touchId,
+      input: pressing.input,
       grabOffsetX: pressing.startX - rect.left,
       grabOffsetY: pressing.startY - rect.top,
       originLeft: rect.left,
@@ -185,6 +205,76 @@ export function attachDrag(board: HTMLElement, options: DragOptions, tuning: Dra
     updateTarget(state);
   }
 
+  function onMouseMove(event: PointerEvent): void {
+    if (state.kind === "idle" || state.input !== "mouse" || state.touchId !== event.pointerId) return;
+    if ((event.buttons & 1) === 0) {
+      finish(null);
+      return;
+    }
+
+    if (state.kind === "pressing") {
+      if (Math.hypot(event.clientX - state.startX, event.clientY - state.startY) < MOUSE_DRAG_THRESHOLD_PX) return;
+
+      startDragging(state);
+    }
+
+    const dragging = state as DragState;
+    if (dragging.kind !== "dragging") return;
+
+    event.preventDefault();
+    dragging.x = event.clientX;
+    dragging.y = event.clientY;
+    moveGhost(dragging);
+    updateTarget(dragging);
+    updateEdge(dragging);
+  }
+
+  function onMouseUp(event: PointerEvent): void {
+    if (state.kind === "idle" || state.input !== "mouse" || state.touchId !== event.pointerId || event.button !== 0) return;
+
+    if (state.kind === "dragging") {
+      const target = columnAt(board, event.clientX, event.clientY);
+      finish(target === null ? null : columnKeyOf(target));
+      return;
+    }
+
+    finish(null);
+  }
+
+  function onMouseCancel(): void {
+    finish(null);
+  }
+
+  function onKeyDown(event: KeyboardEvent): void {
+    if (event.key === "Escape") finish(null);
+  }
+
+  board.addEventListener("pointerdown", (event) => {
+    suppressMouseClick = false;
+    if (event.pointerType !== "mouse") return;
+
+    if (event.button !== 0 || state.kind !== "idle") return;
+
+    const card = event.target instanceof Element ? event.target.closest<HTMLElement>(".card[data-name]") : null;
+    if (card === null || !board.contains(card) || !options.canLift(card)) return;
+
+    state = { kind: "pressing", card, touchId: event.pointerId, input: "mouse", startX: event.clientX, startY: event.clientY, timer: 0 };
+    window.addEventListener("pointermove", onMouseMove, { passive: false });
+    window.addEventListener("pointerup", onMouseUp);
+    window.addEventListener("pointercancel", onMouseCancel);
+    window.addEventListener("blur", onMouseCancel);
+    window.addEventListener("keydown", onKeyDown);
+  });
+
+  board.addEventListener("click", (event) => {
+    if (!suppressMouseClick) return;
+
+    suppressMouseClick = false;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }, true);
+  board.addEventListener("dragstart", (event) => event.preventDefault());
+
   board.addEventListener(
     "touchstart",
     (event) => {
@@ -203,6 +293,7 @@ export function attachDrag(board: HTMLElement, options: DragOptions, tuning: Dra
         kind: "pressing",
         card,
         touchId: touch.identifier,
+        input: "touch",
         startX: touch.clientX,
         startY: touch.clientY,
         timer: 0,

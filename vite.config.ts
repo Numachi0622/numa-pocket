@@ -2,7 +2,7 @@ import { defineConfig, type Plugin } from "vite";
 
 const CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
-  "connect-src https://api.github.com",
+  "connect-src 'self' https://api.github.com",
   "script-src 'self'",
 ].join("; ");
 
